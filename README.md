@@ -267,7 +267,7 @@ The library is written against iOS 17 APIs. Newer OS features (e.g. the iOS 26 `
 Add via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/jmfieldman/SwiftAsyncEx.git", from: "0.1.0")
+.package(url: "https://github.com/jmfieldman/SwiftAsyncEx.git", from: "1.0.0")
 ```
 
 and depend on the `SwiftAsyncEx` product from your target.
