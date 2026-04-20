@@ -166,6 +166,70 @@ final class PersistentPropertyTests: XCTestCase {
         cont.finish()
     }
 
+    // MARK: - Background-task ergonomics
+
+    nonisolated func testSetFromBackgroundTaskUpdatesValue() async {
+        let engine = InMemoryStorageEngine()
+        let p = await MainActor.run {
+            PersistentProperty(storageEngine: engine, key: "k", defaultValue: 0)
+        }
+        await Task.detached {
+            await p.set(42)
+        }.value
+        let v = await MainActor.run { p.value }
+        XCTAssertEqual(v, 42)
+    }
+
+    nonisolated func testSetFromBackgroundFlushesToEngine() async throws {
+        let engine = InMemoryStorageEngine()
+        let p = await MainActor.run {
+            PersistentProperty(storageEngine: engine, key: "k", defaultValue: 0)
+        }
+        await Task.detached {
+            await p.set(99)
+        }.value
+        await p.awaitPendingFlush()
+        let stored: Int? = try engine.retrieve(key: .init(key: "k"))
+        XCTAssertEqual(stored, 99)
+    }
+
+    nonisolated func testReadFromBackgroundTaskReturnsCurrentValue() async {
+        let engine = InMemoryStorageEngine()
+        let p = await MainActor.run {
+            PersistentProperty(storageEngine: engine, key: "k", defaultValue: 7)
+        }
+        let got = await Task.detached {
+            await p.read()
+        }.value
+        XCTAssertEqual(got, 7)
+    }
+
+    nonisolated func testSequentialSetsFromBackgroundArriveInOrder() async {
+        let engine = RecordingEngine()
+        let p = await MainActor.run {
+            PersistentProperty(storageEngine: engine, key: "k", defaultValue: 0)
+        }
+        await Task.detached {
+            await p.set(1)
+            await p.set(2)
+            await p.set(3)
+        }.value
+        await p.awaitPendingFlush()
+        XCTAssertEqual(engine.storedInts(for: "k"), [1, 2, 3])
+    }
+
+    nonisolated func testReadAfterSetObservesWrite() async {
+        let engine = InMemoryStorageEngine()
+        let p = await MainActor.run {
+            PersistentProperty(storageEngine: engine, key: "k", defaultValue: 0)
+        }
+        let got = await Task.detached {
+            await p.set(123)
+            return await p.read()
+        }.value
+        XCTAssertEqual(got, 123)
+    }
+
     // MARK: - Optional Value type
 
     func testOptionalValueType() async throws {

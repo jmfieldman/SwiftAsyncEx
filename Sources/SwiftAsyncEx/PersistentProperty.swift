@@ -145,6 +145,19 @@ public final class PersistentProperty<Value: Codable & Sendable> {
         await lastFlushTask?.value
     }
 
+    /// Set the value from any isolation context. Hops to MainActor internally
+    /// so call sites in background tasks don't need `await MainActor.run { ... }`
+    /// ceremony. Sequential `await property.set(_:)` calls from a single task
+    /// land in call order.
+    public nonisolated func set(_ newValue: Value) async {
+        await MainActor.run { self.value = newValue }
+    }
+
+    /// Read the value from any isolation context. Hops to MainActor internally.
+    public nonisolated func read() async -> Value {
+        await MainActor.run { self.value }
+    }
+
     // MARK: - Flush machinery
 
     /// Schedule a flush of `newValue` to the engine. Flushes are chained via

@@ -1,7 +1,5 @@
 # SwiftAsyncEx
 
-> **Status:** early / pre-1.0. API is likely to shift as patterns settle.
-
 SwiftAsyncEx is a small library of ergonomic helpers around Swift **Structured Concurrency** and the **Observation** framework. It is the set of pieces you tend to write once per project when you commit to `async`/`await`, `AsyncSequence`, `@Observable`, and SwiftUI — extracted into one place so you do not write them again.
 
 The library is intentionally narrow. It does not try to be a reactive framework, it does not introduce a new stream type, and it does not wrap `Task`. It fills the gaps that show up when you lean on the built-in primitives for a real app.
@@ -21,9 +19,7 @@ That story is real but not complete. A handful of patterns recur often enough, a
 
 These are small things. The point of the rewrite-to-structured-concurrency story is that you **stopped needing most of the old machinery**. SwiftAsyncEx is the short list of what is left.
 
-## Planned contents
-
-These are the pieces this library intends to ship. Some are scaffolded, some are not yet written; this README precedes the implementation.
+## Contents
 
 ### `Task.onChange(of:perform:) -> Task<Void, Never>`
 
@@ -59,7 +55,7 @@ final class SaveButtonModel {
 }
 ```
 
-The `weak(_:)` convenience captures the owner weakly, passes the non-nil owner into the work closure (so the body can shadow-rebind it as `self` and read naturally), and skips execution if the owner has been deallocated.
+The `weak(_:)` convenience captures the owner weakly, passes the non-nil owner into the work closure (so the body can shadow-rebind it as `self` and read naturally), and skips execution (returning `nil` from `run(_:)`) if the owner has been deallocated. It is available for `Output == Void` — the common fire-and-forget UI shape. For non-Void `Output`, callers that want weak-self semantics capture `[weak self]` inside the work closure themselves and choose their own "owner is gone" return value.
 
 A parameterized variant takes an input per call:
 
@@ -69,6 +65,8 @@ let saveItem = SerialTask<Item, Void>.weak(self) { `self`, item in
 }
 saveItem.run(item)
 ```
+
+While a task is in flight, further `run(_:)` calls return `nil` immediately and are discarded — not queued, not coalesced, not replace-in-flight. "Replace the current work" is available explicitly via `cancel()` + `run(_:)`.
 
 Reach for this when the plain `guard !isSaving else { return }` pattern starts to repeat. Most screens do not need it.
 
@@ -130,20 +128,21 @@ The four-state enum for screens that need to distinguish "have not started" from
 
 ### `PersistentProperty<Value: Codable & Sendable>`
 
-A persistent, Observation-compatible reference to a single Codable value, backed by a pluggable storage engine. Constructed with a `storageEngine`, a `key`, and a `defaultValue`; read and written through `.value`; participates in `@Observable` read-tracking when held by an `@Observable` container.
+A persistent, `@Observable @MainActor` reference to a single `Codable` value, backed by a pluggable storage engine. Constructed with a `storageEngine`, a `key`, and a `defaultValue`; read and written synchronously through `.value`. Writes update the in-memory value immediately, fire Observation tracking, and schedule an async flush to the backing engine on a detached task so the main thread is never blocked by storage I/O.
 
 ```swift
 let onboarded = PersistentProperty(
-    storageEngine: userDefaults,
+    storageEngine: UserDefaultsStorageEngine(),
     key: "hasOnboarded",
     defaultValue: false
 )
 
-onboarded.value = true          // synchronous write; flushed to the engine
+onboarded.value = true          // synchronous write; flush scheduled off-main
 let seen = onboarded.value      // synchronous read
+await onboarded.awaitPendingFlush()  // optional: wait for the flush to land
 ```
 
-Writes update the in-memory value immediately and are flushed to the backing engine; storage errors surface through an observable `error` property rather than throwing from the setter, so call sites stay ergonomic and UI can react to failures as state.
+Flushes for a given property are serialized — consecutive writes reach the engine in caller order, so the on-disk value never reorders. Storage errors surface through an observable `error` property rather than throwing from the setter, so call sites stay ergonomic and UI can bind to failure state.
 
 The intent is that instances are **held privately inside a containing `@Observable` class** and re-exposed to callers as computed properties that satisfy a public, read-only protocol surface:
 
@@ -156,12 +155,12 @@ public protocol AppPrefs: Observable {
 @MainActor @Observable
 final class AppPrefsImpl: AppPrefs {
     private let _hasOnboarded = PersistentProperty(
-        storageEngine: UserDefaultsStorageEngine.standard,
+        storageEngine: UserDefaultsStorageEngine(),
         key: "hasOnboarded",
         defaultValue: false
     )
     private let _themeName = PersistentProperty(
-        storageEngine: UserDefaultsStorageEngine.standard,
+        storageEngine: UserDefaultsStorageEngine(),
         key: "themeName",
         defaultValue: "system"
     )
@@ -177,25 +176,41 @@ final class AppPrefsImpl: AppPrefs {
 }
 ```
 
-Keys are expressed as `PersistentPropertyKey` (main key + optional subkey, with automatic sanitization so the same key works across filesystem- and keychain-style engines); a `CustomStringConvertible` convenience overload accepts a plain string.
+Keys are expressed as `PersistentPropertyKey` (main key + optional subkey, with automatic sanitization so the same key works across filesystem- and keychain-style engines); a `CustomStringConvertible` convenience overload accepts a plain string. An in-place `modify(_:)` helper is available for mutating collection / struct values.
+
+#### Updating from a background task
+
+Because `PersistentProperty` is `@MainActor`, writes from background contexts need to hop to the main actor. Two `nonisolated async` helpers let you do that without `await MainActor.run { ... }` ceremony at the call site:
+
+```swift
+Task.detached {
+    let fetched = try await api.fetchProfile()
+    await profile.set(fetched)      // one await, no MainActor.run
+    let current = await profile.read()
+}
+```
+
+Sequential `await property.set(_:)` calls from a single task land in call order; `read()` returns the current value after hopping to the main actor.
 
 #### Storage engines
 
 `PersistentPropertyStorageEngine` is the pluggability point — any `store` / `retrieve` backend implements it. The library ships with:
 
-- **`UserDefaultsStorageEngine`** — `.standard` or a named suite.
-- **`FileStorageEngine`** — JSON-on-disk with atomic writes, scoped to a chosen directory (Documents / Caches / Temporary / App Group). Replaces the earlier "file-backed Codable store" idea as a first-class engine.
-- **`KeychainStorageEngine`** — per-service, per-access-group keychain storage with optional iCloud synchronization.
-- **`InMemoryStorageEngine`** — ephemeral, test-friendly.
+- **`UserDefaultsStorageEngine`** — wraps a `UserDefaults` instance (defaults to `.standard`; pass a suite-specific instance for scoping).
+- **`FileStorageEngine`** — one JSON file per key with atomic writes, scoped to an explicit `URL` or a well-known directory (Documents / Caches / Temporary / App Group) with optional subpath.
+- **`KeychainStorageEngine`** — `kSecClassGenericPassword` storage scoped by `service`, with optional `accessGroup` (entitlement-gated) and optional `synchronized` iCloud Keychain.
+- **`InMemoryStorageEngine`** — ephemeral, test-friendly; JSON round-trip mirrors the on-disk engines' Codable semantics.
 
 Additional engines are straightforward to implement against the protocol.
 
-### `AsyncDemuxer<Output: Sendable>`
+### `AsyncDemuxer<Output>` / `ThrowingAsyncDemuxer<Output>`
 
 Single-flight coalescing for a **parameterless** async operation. Multiple concurrent callers that hit the demuxer while work is in flight all wait on the same underlying `Task`; when it resolves, every caller receives the same result. When no callers are waiting and the value is requested again, a fresh execution begins.
 
+Two sibling types mirror Swift's `Task` / `TaskGroup` vs. `ThrowingTaskGroup` pattern: `AsyncDemuxer` for non-throwing work, `ThrowingAsyncDemuxer` for work that may fail.
+
 ```swift
-let refresh = AsyncDemuxer<Profile> {
+let refresh = ThrowingAsyncDemuxer<Profile> {
     try await api.fetchProfile()
 }
 
@@ -205,16 +220,18 @@ async let b = refresh.execute()
 let (p1, p2) = try await (a, b)
 ```
 
+The throwing variant handles per-waiter cancellation — cancelling one awaiter throws `CancellationError` for that caller while the shared task and other waiters continue unaffected.
+
 Useful for "refresh current user," "load app config," and similar idempotent, unparameterized fetches.
 
-### `KeyedAsyncDemuxer<Key: Hashable, Output: Sendable>`
+### `KeyedAsyncDemuxer<Key, Output>` / `ThrowingKeyedAsyncDemuxer<Key, Output>`
 
-The parameterized variant: one demuxer instance handles many keys, and concurrent callers for the same key share a single execution. Different keys run in parallel.
+The parameterized variants: one demuxer instance handles many keys, and concurrent callers for the same key share a single execution. Different keys run in parallel.
 
 Constructed with a factory closure that produces the async work for a given key:
 
 ```swift
-let images = KeyedAsyncDemuxer<URL, UIImage> { url in
+let images = ThrowingKeyedAsyncDemuxer<URL, UIImage> { url in
     try await ImageLoader.load(url)
 }
 
@@ -229,8 +246,7 @@ Intended for per-key caches, per-ID fetches, and any pattern where "the same und
 2. **No new paradigm.** The library does not introduce a stream type, a scheduler, or a reactive surface. Everything composes with plain `async`, `AsyncSequence`, `Task`, and `@Observable`.
 3. **Migration-aware.** Anywhere Swift or Foundation is about to ship a replacement, the helper is designed so its call sites migrate mechanically when the deployment floor rises. `Task.onChange` is the clearest example — it will be deletable in favor of `Observations { … }`.
 4. **iOS 17 is the floor.** The library compiles and runs on iOS 17 / macOS 14 / tvOS 17 / watchOS 10 using only APIs available at that floor. Any use of a newer API (for example the iOS 26 `Observations` sequence) is gated behind `@available` with a working fallback on the floor; no public API requires a higher OS than the package minimum.
-5. **`@MainActor` by default where it matters.** UI-facing helpers (`Task.onChange`, `SerialTask`, `TaskBag`) are MainActor-bound. Data-layer helpers (`AsyncDemuxer`, `PersistentProperty` and its engines) are `Sendable` and actor-agnostic; they are safe to hold inside a MainActor container.
-6. **Typed errors welcome.** Public async APIs use `async throws(E) -> T` where it reads cleanly; helpers that cannot pick an `E` stay generic.
+5. **`@MainActor` where state and UI meet, `Sendable` elsewhere.** Helpers that expose observable state or are typically held by a view model / manager — `Task.onChange`, `SerialTask`, `TaskBag`, `PersistentProperty` — are MainActor-bound. Purely data-layer helpers — `AsyncDemuxer`, `ThrowingAsyncDemuxer`, `KeyedAsyncDemuxer`, `ThrowingKeyedAsyncDemuxer`, and the `PersistentPropertyStorageEngine` implementations — are `Sendable` and actor-agnostic; they are safe to hold inside a MainActor container and to invoke from any isolation context.
 
 ## Non-goals
 
@@ -248,7 +264,7 @@ The library is written against iOS 17 APIs. Newer OS features (e.g. the iOS 26 `
 
 ## Installation
 
-Once published, add via Swift Package Manager:
+Add via Swift Package Manager:
 
 ```swift
 .package(url: "https://github.com/jmfieldman/SwiftAsyncEx.git", from: "0.1.0")
@@ -258,8 +274,8 @@ and depend on the `SwiftAsyncEx` product from your target.
 
 ## License
 
-MIT. See `LICENSE` (to be added).
+MIT.
 
 ## Contributing
 
-The library is in its shaping phase. Issues proposing additional helpers are welcome, but the bar is high: **"this exact pattern repeats everywhere and the boilerplate has a real footgun."** If it is just a convenience that wraps one line of `async` code, it probably does not belong here.
+Issues proposing additional helpers are welcome, but the bar is deliberately high: **"this exact pattern repeats everywhere and the boilerplate has a real footgun."** If it is just a convenience that wraps one line of `async` code, it probably does not belong here.
