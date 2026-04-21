@@ -42,7 +42,7 @@ final class PropertyBindingTests: XCTestCase {
         // After cancel, further yields should not affect dest.
         cont.yield(999)
         // Give the (now-cancelled) pump a chance to (not) run.
-        for _ in 0 ..< 10 { await Task<Never, Never>.yield() }
+        for _ in 0..<10 { await Task<Never, Never>.yield() }
         XCTAssertEqual(dest.value, 1)
         cont.finish()
     }
@@ -95,7 +95,7 @@ final class PropertyBindingTests: XCTestCase {
         equalTo target: Value,
         maxYields: Int = 20
     ) async throws {
-        for _ in 0 ..< maxYields {
+        for _ in 0..<maxYields {
             if property.value == target { return }
             await Task<Never, Never>.yield()
         }
@@ -114,7 +114,7 @@ final class PropertyBindingTests: XCTestCase {
         equalTo target: Value,
         maxYields: Int = 20
     ) async throws {
-        for _ in 0 ..< maxYields {
+        for _ in 0..<maxYields {
             if property.value == target { return }
             await Task<Never, Never>.yield()
         }

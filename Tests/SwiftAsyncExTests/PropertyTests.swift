@@ -141,7 +141,7 @@ final class PropertyTests: XCTestCase {
         equalTo target: Value,
         maxYields: Int = 20
     ) async throws {
-        for _ in 0 ..< maxYields {
+        for _ in 0..<maxYields {
             if property.value == target { return }
             await Task<Never, Never>.yield()
         }
