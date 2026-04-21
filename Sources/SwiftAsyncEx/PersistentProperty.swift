@@ -75,7 +75,7 @@ public struct PersistentPropertyKey: Hashable, Sendable {
 /// order, so the on-disk value never lags behind or reorders.
 @Observable
 @MainActor
-public final class PersistentProperty<Value: Codable & Sendable> {
+public final class PersistentProperty<Value: Codable & Sendable>: MutablePropertyProtocol {
     /// The current value. Reading registers observation tracking; writing
     /// updates the in-memory value synchronously and schedules a flush to
     /// the underlying engine.

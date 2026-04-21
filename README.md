@@ -15,6 +15,7 @@ That story is real but not complete. A handful of patterns recur often enough, a
 - **Binding a `Task`'s lifetime to an owning object.** Structured concurrency cancels child tasks when their scope ends, but the common UI pattern — work kicked off from a synchronous event that should be bounded by a view model's or manager's lifetime — has no built-in analog. A plain `Task` outlives every reference to it. A bag + `bind(to:)` pattern (the `Set<AnyCancellable>` equivalent for `Task`) covers this.
 - **"Only one at a time" UI actions.** Tap-spam protection on buttons that kick off `async` work, with an `isExecuting` flag the view can bind to. Easy to hand-roll per site, tedious to hand-roll everywhere, and subtly wrong when you do.
 - **Loading state as a first-class type.** Distinguishing "haven't started," "loading," "loaded(value)," and "failed(error)" is common enough to deserve a shared enum rather than four scattered `Bool`s.
+- **Vending observable state as a read-only handle.** Exposing a value so consumers can observe it but not mutate it, without coupling their interface to your concrete producer type. The internal-`MutableProperty` / public-`Property` pattern — the observable-era analog of `CurrentValueSubject` + `eraseToAnyPublisher`.
 - **Single persistent values backed by `UserDefaults`, a file, or the keychain.** Most apps have a long tail of "one Codable thing we need to survive relaunch" values that do not warrant SwiftData. A read/write reference with a pluggable storage engine, error reporting as observable state, and participation in Observation tracking handles them uniformly.
 
 These are small things. The point of the rewrite-to-structured-concurrency story is that you **stopped needing most of the old machinery**. SwiftAsyncEx is the short list of what is left.
@@ -126,9 +127,76 @@ public enum LoadableResult<T, E: Error> {
 
 The four-state enum for screens that need to distinguish "have not started" from "empty." Comes with convenience accessors (`value`, `error`, `isLoading`) and the usual `map` / `mapError`.
 
+### `PropertyProtocol<Value>` / `MutableProperty<Value>` / `Property<Value>`
+
+Read/write observable-value handles built for a specific job: **vending an observable `T` to a consumer without coupling them to your producer type**. The internal-mutable / public-readonly pattern that `CurrentValueSubject` + `eraseToAnyPublisher` covered in the Combine era, re-expressed for `@Observable`.
+
+The common pattern:
+
+```swift
+public protocol UnreadCountSource: Observable {
+    var unreadCount: any PropertyProtocol<Int> { get }
+}
+
+@MainActor @Observable
+final class InboxManager: UnreadCountSource {
+    private let _unread = MutableProperty(0)
+    let unreadCount: any PropertyProtocol<Int>
+
+    init() {
+        self.unreadCount = Property(mirroring: _unread)
+    }
+
+    func markRead() { _unread.modify { $0 -= 1 } }
+}
+```
+
+The consumer's interface is `any PropertyProtocol<Int>` — any class that can project its state into an observable `Int` can satisfy it. The consumer cannot cast back to `MutableProperty<Int>` and write: `Property<T>` is a distinct concrete type with no setter, so the read-only guarantee is structural, not a convention.
+
+#### `MutableProperty<Value>`
+
+An `@Observable @MainActor` single-value box. Read and write through `.value`; use `modify(_:)` for atomic in-place mutation of collection / struct values. Cross-actor `set(_:) async` / `read() async` helpers let background tasks update the value without `await MainActor.run { ... }` ceremony at the call site.
+
+#### `Property<Value>` constructors
+
+- `Property.constant(_:)` — fixed value, no pump.
+- `Property(mirroring:)` — wrap any `PropertyProtocol<T>` (a `MutableProperty`, `PersistentProperty`, or another `Property`) as a read-only handle. The common vending case.
+- `Property(tracking: { ... })` — derive a value from a closure that reads `@Observable` state. Updates when any state the closure reads changes. The general-purpose `map` / `combineLatest` / keyPath-projection constructor collapsed into one Observation-tracked closure.
+- `Property(initial: T, from: seq)` — seed a value, then follow an `AsyncSequence<T>`. Bridges `AsyncChannel`, `AsyncStream`, `NotificationCenter.notifications(...)`, Combine's `.values`, and anything else that adopts `AsyncSequence`.
+
+Mirror- and tracking-mode updates lag source writes by one runloop tick (Observation's `onChange` fires on `willSet`; the internal pump yields before re-reading so the committed value is the one propagated). The pump is bound to the `Property`'s lifetime — when it deallocates, the pump is cancelled automatically.
+
+#### Binding operator `<~`
+
+Any `MutablePropertyProtocol` — `MutableProperty`, `PersistentProperty`, or your own conformer — accepts pumped values via `<~`:
+
+```swift
+let counter = MutableProperty(0)
+counter <~ asyncSequence        // pump AsyncSequence elements into the property
+counter <~ otherProperty        // mirror another PropertyProtocol
+```
+
+The returned `Task<Void, Never>` is auto-bound to the destination's lifetime; the binding stops when the destination deallocates. Capture the task and `.cancel()` to tear the binding down early.
+
+#### Bridging back to `AsyncSequence`
+
+`asAsyncSequence()` on any `PropertyProtocol` returns an `AsyncStream<Value>` that yields the current value immediately and then each subsequent change — useful for non-UI consumers that prefer `for await`:
+
+```swift
+for await count in inbox.unreadCount.asAsyncSequence() {
+    await audit.record(count)
+}
+```
+
+#### What is deliberately not here
+
+No `map`, `combineLatest`, `flatMap`, `filter`, `removeDuplicates`, or other operators. Derivations that belong on your own `@Observable` are computed properties; derivations that must escape your class's type identity are `Property(tracking: { ... })`. One closure-based API covers both cleanly without inviting Combine-shaped operator chains.
+
 ### `PersistentProperty<Value: Codable & Sendable>`
 
 A persistent, `@Observable @MainActor` reference to a single `Codable` value, backed by a pluggable storage engine. Constructed with a `storageEngine`, a `key`, and a `defaultValue`; read and written synchronously through `.value`. Writes update the in-memory value immediately, fire Observation tracking, and schedule an async flush to the backing engine on a detached task so the main thread is never blocked by storage I/O.
+
+`PersistentProperty` conforms to `MutablePropertyProtocol<Value>` — it accepts `<~` bindings, can be wrapped in a `Property(mirroring:)` for read-only vending, and participates in any generic code written against the property protocols.
 
 ```swift
 let onboarded = PersistentProperty(
@@ -246,7 +314,7 @@ Intended for per-key caches, per-ID fetches, and any pattern where "the same und
 2. **No new paradigm.** The library does not introduce a stream type, a scheduler, or a reactive surface. Everything composes with plain `async`, `AsyncSequence`, `Task`, and `@Observable`.
 3. **Migration-aware.** Anywhere Swift or Foundation is about to ship a replacement, the helper is designed so its call sites migrate mechanically when the deployment floor rises. `Task.onChange` is the clearest example — it will be deletable in favor of `Observations { … }`.
 4. **iOS 17 is the floor.** The library compiles and runs on iOS 17 / macOS 14 / tvOS 17 / watchOS 10 using only APIs available at that floor. Any use of a newer API (for example the iOS 26 `Observations` sequence) is gated behind `@available` with a working fallback on the floor; no public API requires a higher OS than the package minimum.
-5. **`@MainActor` where state and UI meet, `Sendable` elsewhere.** Helpers that expose observable state or are typically held by a view model / manager — `Task.onChange`, `SerialTask`, `TaskBag`, `PersistentProperty` — are MainActor-bound. Purely data-layer helpers — `AsyncDemuxer`, `ThrowingAsyncDemuxer`, `KeyedAsyncDemuxer`, `ThrowingKeyedAsyncDemuxer`, and the `PersistentPropertyStorageEngine` implementations — are `Sendable` and actor-agnostic; they are safe to hold inside a MainActor container and to invoke from any isolation context.
+5. **`@MainActor` where state and UI meet, `Sendable` elsewhere.** Helpers that expose observable state or are typically held by a view model / manager — `Task.onChange`, `SerialTask`, `TaskBag`, `MutableProperty`, `Property`, `PersistentProperty` — are MainActor-bound. Purely data-layer helpers — `AsyncDemuxer`, `ThrowingAsyncDemuxer`, `KeyedAsyncDemuxer`, `ThrowingKeyedAsyncDemuxer`, and the `PersistentPropertyStorageEngine` implementations — are `Sendable` and actor-agnostic; they are safe to hold inside a MainActor container and to invoke from any isolation context.
 
 ## Non-goals
 
@@ -267,7 +335,7 @@ The library is written against iOS 17 APIs. Newer OS features (e.g. the iOS 26 `
 Add via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/jmfieldman/SwiftAsyncEx.git", from: "1.0.0")
+.package(url: "https://github.com/jmfieldman/SwiftAsyncEx.git", from: "1.1.0")
 ```
 
 and depend on the `SwiftAsyncEx` product from your target.
