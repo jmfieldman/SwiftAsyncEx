@@ -8,7 +8,7 @@ import Observation
 
 /// A single-value `@Observable` box. Reads and writes are synchronous; writes
 /// fire Observation tracking so SwiftUI / `withObservationTracking` /
-/// `Task.onChange` see the change.
+/// `Task.observe` see the change.
 ///
 /// Use this when you need to pass a mutable observable value around between
 /// objects as a standalone reference — the analog of declaring a

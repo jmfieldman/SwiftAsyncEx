@@ -35,7 +35,7 @@ final class MutablePropertyTests: XCTestCase {
     func testValueChangesAreObservable() async {
         let p = MutableProperty(0)
         let (stream, cont) = AsyncStream<Int>.makeStream()
-        let obs = Task.onChange(of: { p.value }) { v in cont.yield(v) }
+        let obs = Task.observe(of: { p.value }, emitInitial: false) { v in cont.yield(v) }
         await Task<Never, Never>.yield()
 
         p.value = 1

@@ -83,6 +83,10 @@ extension Task where Success: Sendable {
     /// Returns self for chaining.
     @discardableResult
     public func bind(to owner: AnyObject) -> Task<Success, Failure> {
+        if let bag = owner as? TaskBag {
+            bag.insert(self)
+            return self
+        }
         TaskBag.associated(with: owner).insert(self)
         return self
     }

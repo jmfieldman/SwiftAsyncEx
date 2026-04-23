@@ -194,7 +194,7 @@ final class SerialTaskTests: XCTestCase {
             await gate.wait()
         }
         let (stream, cont) = AsyncStream<Bool>.makeStream()
-        let obs = Task.onChange(of: { t.isExecuting }) { value in
+        let obs = Task.observe(of: { t.isExecuting }, emitInitial: false) { value in
             cont.yield(value)
         }
 

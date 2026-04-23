@@ -10,7 +10,7 @@ import Observation
 /// is bound at construction; `run(_:)` fires it. While a task is in flight,
 /// further calls to `run(_:)` are skipped and return `nil`.
 ///
-/// `isExecuting` is observable — SwiftUI views and `Task.onChange(of:)`
+/// `isExecuting` is observable — SwiftUI views and `Task.observe(of:)`
 /// consumers can bind to it directly.
 @Observable
 @MainActor

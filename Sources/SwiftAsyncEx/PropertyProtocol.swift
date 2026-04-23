@@ -9,7 +9,7 @@ import Observation
 // MARK: - PropertyProtocol
 
 /// A read-only observable reference to a value. Reads register Observation
-/// tracking, so consumers (SwiftUI, `withObservationTracking`, `Task.onChange`)
+/// tracking, so consumers (SwiftUI, `withObservationTracking`, `Task.observe`)
 /// re-evaluate when the value changes.
 ///
 /// The protocol exists so producers can vend a value to consumers without
