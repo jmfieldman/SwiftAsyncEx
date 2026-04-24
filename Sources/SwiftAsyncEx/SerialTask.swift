@@ -18,14 +18,14 @@ import Observation
 /// through `run(_:)`, `fire(_:)`, and `cancel()`.
 @Observable
 @MainActor
-public final class SerialTask<Input, Output: Sendable> {
+public final class SerialTask<Input, Output: Sendable>: Sendable {
     /// Thrown by `run(_:)` when a task is already in flight.
-    public struct AlreadyExecuting: Error {}
+    public struct AlreadyExecuting: Error, Sendable {}
 
     /// Thrown by `run(_:)` when a `weak(_:)` factory's owner has been
     /// deallocated. Not thrown by the plain initializer or by
     /// `weak(_:default:)`, which substitutes the default value instead.
-    public struct OwnerDeallocated: Error {}
+    public struct OwnerDeallocated: Error, Sendable {}
 
     /// True while a task is currently in flight.
     public private(set) var isExecuting: Bool = false

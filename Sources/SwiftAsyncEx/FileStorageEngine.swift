@@ -21,7 +21,7 @@ public final class FileStorageEngine: PersistentPropertyStorageEngine, @unchecke
         case appGroup(String)
     }
 
-    public enum StorageError: Error {
+    public enum StorageError: Error, Sendable {
         /// The selected root directory could not be located (typically
         /// `.appGroup` with an unconfigured entitlement).
         case noRootDirectory

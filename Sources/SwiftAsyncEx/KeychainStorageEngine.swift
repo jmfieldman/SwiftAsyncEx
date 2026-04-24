@@ -18,7 +18,7 @@ import Security
 /// `StorageError.securityError(OSStatus)` so callers can inspect the
 /// status code if needed.
 public final class KeychainStorageEngine: PersistentPropertyStorageEngine, @unchecked Sendable {
-    public enum StorageError: Error {
+    public enum StorageError: Error, Sendable {
         /// The underlying `Security.framework` call returned a non-success
         /// status. The raw `OSStatus` is preserved for inspection.
         case securityError(OSStatus)
