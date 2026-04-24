@@ -17,91 +17,169 @@ final class SerialTaskTests: XCTestCase {
         XCTAssertFalse(t.isExecuting)
     }
 
-    func testRunFlipsIsExecutingAndBacksOff() async {
-        let t = SerialTask<Void, Void> {
+    func testRunReturnsOutputAndClearsIsExecuting() async throws {
+        let t = SerialTask<Void, Int> {
             await Task<Never, Never>.yield()
+            return 7
         }
-        let handle = t.run()
-        XCTAssertNotNil(handle)
+        let value = try await t.run()
+        XCTAssertEqual(value, 7)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testIsExecutingTrueWhileWorkIsInFlight() async throws {
+        let gate = Gate()
+        let t = SerialTask<Void, Void> {
+            await gate.wait()
+        }
+        let runTask = Task { try await t.run() }
+        // Let run() pass its guards and flip isExecuting.
+        await Task<Never, Never>.yield()
         XCTAssertTrue(t.isExecuting)
-        _ = await handle?.value
+        gate.open()
+        _ = try await runTask.value
         XCTAssertFalse(t.isExecuting)
     }
 
     // MARK: - Serial skip semantics
 
-    func testRunSkipsWhileInFlight() async {
+    func testSecondRunThrowsAlreadyExecuting() async throws {
         let gate = Gate()
         let t = SerialTask<Void, Void> {
             await gate.wait()
         }
-        let h1 = t.run()
-        XCTAssertNotNil(h1)
-        let h2 = t.run()
-        XCTAssertNil(h2)
-        let h3 = t.run()
-        XCTAssertNil(h3)
+        let first = Task { try await t.run() }
+        await Task<Never, Never>.yield()
+        XCTAssertTrue(t.isExecuting)
+
+        do {
+            try await t.run()
+            XCTFail("Expected AlreadyExecuting to throw")
+        } catch is SerialTask<Void, Void>.AlreadyExecuting {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
         gate.open()
-        _ = await h1?.value
-        XCTAssertFalse(t.isExecuting)
+        _ = try await first.value
     }
 
-    func testRunDoesNotDuplicateWorkWhileInFlight() async {
+    func testTryQuestionMarkCollapsesToNil() async {
+        let gate = Gate()
+        let t = SerialTask<Void, Int> {
+            await gate.wait()
+            return 99
+        }
+        let first = Task { try await t.run() }
+        await Task<Never, Never>.yield()
+
+        // try? converts both AlreadyExecuting and OwnerDeallocated to nil.
+        let skipped: Int? = try? await t.run()
+        XCTAssertNil(skipped)
+
+        gate.open()
+        let firstResult = try? await first.value
+        XCTAssertEqual(firstResult, 99)
+    }
+
+    func testRunDoesNotDuplicateWorkWhileInFlight() async throws {
         let gate = Gate()
         let counter = Counter()
         let t = SerialTask<Void, Void> {
             counter.increment()
             await gate.wait()
         }
-        let h1 = t.run()
+        let first = Task { try await t.run() }
         // Let the task start executing so counter increments.
         await Task<Never, Never>.yield()
-        _ = t.run()  // Should be skipped.
-        _ = t.run()  // Should be skipped.
+
+        let second: Void? = try? await t.run()
+        let third: Void? = try? await t.run()
+        XCTAssertNil(second)
+        XCTAssertNil(third)
+
         gate.open()
-        _ = await h1?.value
+        _ = try await first.value
         XCTAssertEqual(counter.value, 1)
     }
 
-    // MARK: - Cancellation
+    // MARK: - Non-Void input / output
 
-    func testCancelResetsIsExecuting() {
-        let gate = Gate()
-        let t = SerialTask<Void, Void> {
-            await gate.wait()
+    func testNonVoidInput() async throws {
+        let received = Counter()
+        let t = SerialTask<Int, Void> { input in
+            received.value = input
         }
-        _ = t.run()
-        XCTAssertTrue(t.isExecuting)
-        t.cancel()
-        XCTAssertFalse(t.isExecuting)
-        gate.open()  // Release any lingering awaiters.
+        try await t.run(42)
+        XCTAssertEqual(received.value, 42)
     }
 
-    func testCancelAllowsFreshRun() async {
+    func testNonVoidOutput() async throws {
+        let t = SerialTask<Void, Int> { 99 }
+        let value = try await t.run()
+        XCTAssertEqual(value, 99)
+    }
+
+    // MARK: - cancel()
+
+    func testCancelResetsIsExecuting() async {
         let gate = Gate()
         let t = SerialTask<Void, Void> {
             await gate.wait()
         }
-        _ = t.run()
+        let runTask = Task { try await t.run() }
+        await Task<Never, Never>.yield()
         XCTAssertTrue(t.isExecuting)
 
         t.cancel()
         XCTAssertFalse(t.isExecuting)
 
-        // A new run() should succeed even though the cancelled task may
-        // still be cooperatively draining.
-        let h2 = t.run()
-        XCTAssertNotNil(h2)
-        XCTAssertTrue(t.isExecuting)
-
-        t.cancel()
         gate.open()
+        // The cancelled run must throw CancellationError.
+        do {
+            _ = try await runTask.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 
-    func testStaleTaskDoesNotFlipIsExecutingForNewRun() async {
-        // Long-running work for the first run; cancel, start a second run
-        // with its own gate. The old task must not flip isExecuting when
-        // it eventually completes.
+    func testCancelAllowsFreshRun() async throws {
+        let gate = Gate()
+        let t = SerialTask<Void, Int> {
+            await gate.wait()
+            return 1
+        }
+        let first = Task { try await t.run() }
+        await Task<Never, Never>.yield()
+        XCTAssertTrue(t.isExecuting)
+
+        t.cancel()
+        XCTAssertFalse(t.isExecuting)
+
+        // A new run should succeed even while the cancelled task's tail
+        // is still draining.
+        let second = Task { try await t.run() }
+        await Task<Never, Never>.yield()
+        XCTAssertTrue(t.isExecuting)
+
+        gate.open()
+        // First is displaced -> CancellationError; second completes.
+        do {
+            _ = try await first.value
+            XCTFail("Expected CancellationError for displaced run")
+        } catch is CancellationError {
+            // expected
+        }
+        let secondValue = try await second.value
+        XCTAssertEqual(secondValue, 1)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testStaleTaskDoesNotFlipIsExecutingForNewRun() async throws {
         let gate1 = Gate()
         let gate2 = Gate()
         let whichGate = GateSelector(gate1: gate1, gate2: gate2)
@@ -111,59 +189,132 @@ final class SerialTaskTests: XCTestCase {
             await g.wait()
         }
 
-        _ = t.run()  // consumes gate1
-        t.cancel()  // the stale task is still draining, waiting on gate1
+        let first = Task { try await t.run() } // consumes gate1
+        await Task<Never, Never>.yield()
+        t.cancel() // stale task still draining
 
-        let h2 = t.run()  // consumes gate2
+        let second = Task { try await t.run() } // consumes gate2
+        await Task<Never, Never>.yield()
         XCTAssertTrue(t.isExecuting)
 
-        // Release the stale task first. Its post-work handler should
-        // detect generation mismatch and NOT flip isExecuting to false.
+        // Release the stale task first; its post-work handler must detect
+        // generation mismatch and NOT flip isExecuting.
         gate1.open()
         await Task<Never, Never>.yield()
         await Task<Never, Never>.yield()
         XCTAssertTrue(t.isExecuting, "Stale task's completion must not flip state for the new run")
 
-        // Now release the new task; it should flip correctly.
         gate2.open()
-        _ = await h2?.value
+        _ = try await second.value
         XCTAssertFalse(t.isExecuting)
+
+        // First must have thrown CancellationError.
+        do {
+            _ = try await first.value
+            XCTFail("Expected CancellationError for stale run")
+        } catch is CancellationError {
+            // expected
+        }
     }
 
-    // MARK: - Non-Void input / output
+    // MARK: - Caller cancellation propagation
 
-    func testNonVoidInput() async {
+    func testCallerCancellationPropagatesToWork() async {
+        let gate = Gate()
+        let observedCancel = Counter()
+        let t = SerialTask<Void, Void> {
+            await withTaskCancellationHandler {
+                await gate.wait()
+            } onCancel: {
+                Task { @MainActor in observedCancel.increment() }
+            }
+        }
+
+        let runTask = Task { try await t.run() }
+        await Task<Never, Never>.yield()
+        XCTAssertTrue(t.isExecuting)
+
+        runTask.cancel()
+
+        // The onCancel handler must fire, propagating cancellation to the
+        // inner work task. Give it a moment to run.
+        await Task<Never, Never>.yield()
+        await Task<Never, Never>.yield()
+        XCTAssertGreaterThanOrEqual(observedCancel.value, 1)
+
+        gate.open()
+        do {
+            _ = try await runTask.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    // MARK: - fire()
+
+    func testFireExecutesWork() async {
+        let gate = Gate()
+        let counter = Counter()
+        let t = SerialTask<Void, Void> {
+            counter.increment()
+            await gate.wait()
+        }
+        t.fire()
+        // Wait for the work body itself to execute, not just isExecuting —
+        // the latter flips before the inner work Task is scheduled.
+        await waitUntil { counter.value == 1 }
+        XCTAssertTrue(t.isExecuting)
+        XCTAssertEqual(counter.value, 1)
+        gate.open()
+        await waitUntil { !t.isExecuting }
+    }
+
+    func testFireSwallowsAlreadyExecuting() async {
+        let gate = Gate()
+        let counter = Counter()
+        let t = SerialTask<Void, Void> {
+            counter.increment()
+            await gate.wait()
+        }
+        t.fire()
+        await waitUntil { counter.value == 1 }
+
+        // Second fire should be a no-op (AlreadyExecuting swallowed).
+        t.fire()
+        t.fire()
+        await Task<Never, Never>.yield()
+        await Task<Never, Never>.yield()
+        XCTAssertEqual(counter.value, 1)
+
+        gate.open()
+        await waitUntil { !t.isExecuting }
+    }
+
+    func testFireWithInput() async {
         let received = Counter()
         let t = SerialTask<Int, Void> { input in
             received.value = input
         }
-        let h = t.run(42)
-        _ = await h?.value
-        XCTAssertEqual(received.value, 42)
+        t.fire(123)
+        await waitUntil { received.value == 123 }
+        XCTAssertEqual(received.value, 123)
     }
 
-    func testNonVoidOutput() async {
-        let t = SerialTask<Void, Int> { 99 }
-        let h = t.run()
-        let value = await h?.value
-        XCTAssertEqual(value, 99)
-    }
+    // MARK: - weak(_:) — throws OwnerDeallocated
 
-    // MARK: - weak(_:) factory
-
-    func testWeakFactoryRunsWhenOwnerAlive() async {
+    func testWeakFactoryRunsWhenOwnerAlive() async throws {
         let owner = WeakTestOwner()
         let t = SerialTask.weak(owner) { `self` in
             self.saves += 1
         }
-        let h = t.run()
-        _ = await h?.value
+        try await t.run()
         XCTAssertEqual(owner.saves, 1)
     }
 
-    func testWeakFactorySkipsWhenOwnerDeallocated() {
-        // Build a SerialTask that weakly holds an owner, then drop the
-        // owner. run() must return nil and leave isExecuting false.
+    func testWeakFactoryThrowsWhenOwnerDeallocated() async {
         let t: SerialTask<Void, Void> = {
             var owner: WeakTestOwner? = WeakTestOwner()
             let t = SerialTask.weak(owner!) { `self` in
@@ -172,18 +323,74 @@ final class SerialTaskTests: XCTestCase {
             owner = nil
             return t
         }()
-        let h = t.run()
-        XCTAssertNil(h)
+        do {
+            try await t.run()
+            XCTFail("Expected OwnerDeallocated")
+        } catch is SerialTask<Void, Void>.OwnerDeallocated {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
         XCTAssertFalse(t.isExecuting)
     }
 
-    func testWeakFactoryWithInput() async {
+    func testWeakFactoryWithInput() async throws {
         let owner = WeakTestOwner()
         let t = SerialTask<Int, Void>.weak(owner) { `self`, input in
             self.saves += input
         }
-        _ = await t.run(5)?.value
+        try await t.run(5)
         XCTAssertEqual(owner.saves, 5)
+    }
+
+    func testWeakFactoryWithNonVoidOutput() async throws {
+        let owner = WeakTestOwner()
+        let t = SerialTask<Void, Int>.weak(owner) { `self` in
+            self.saves += 1
+            return self.saves
+        }
+        let result = try await t.run()
+        XCTAssertEqual(result, 1)
+    }
+
+    // MARK: - weak(_:default:) — substitutes default
+
+    func testWeakWithDefaultRunsWhenOwnerAlive() async throws {
+        let owner = WeakTestOwner()
+        let t = SerialTask<Void, Int>.weak(owner, default: -1) { `self` in
+            self.saves += 1
+            return self.saves
+        }
+        let result = try await t.run()
+        XCTAssertEqual(result, 1)
+    }
+
+    func testWeakWithDefaultReturnsDefaultWhenOwnerDeallocated() async throws {
+        let t: SerialTask<Void, Int> = {
+            var owner: WeakTestOwner? = WeakTestOwner()
+            let t = SerialTask<Void, Int>.weak(owner!, default: -1) { `self` in
+                self.saves += 1
+                return self.saves
+            }
+            owner = nil
+            return t
+        }()
+        let result = try await t.run()
+        XCTAssertEqual(result, -1)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testWeakWithDefaultAndInput() async throws {
+        let t: SerialTask<Int, String> = {
+            var owner: WeakTestOwner? = WeakTestOwner()
+            let t = SerialTask<Int, String>.weak(owner!, default: "fallback") { _, _ in
+                "real"
+            }
+            owner = nil
+            return t
+        }()
+        let result = try await t.run(42)
+        XCTAssertEqual(result, "fallback")
     }
 
     // MARK: - Observation tracking
@@ -200,7 +407,7 @@ final class SerialTaskTests: XCTestCase {
 
         await Task<Never, Never>.yield()
 
-        _ = t.run()
+        t.fire()
         var iter = stream.makeAsyncIterator()
         let first = await iter.next()
         XCTAssertEqual(first, true)
@@ -258,4 +465,15 @@ private final class Counter {
 @MainActor
 private final class WeakTestOwner {
     var saves: Int = 0
+}
+
+@MainActor
+private func waitUntil(
+    maxYields: Int = 200,
+    _ condition: @MainActor () -> Bool
+) async {
+    for _ in 0 ..< maxYields {
+        if condition() { return }
+        await Task<Never, Never>.yield()
+    }
 }

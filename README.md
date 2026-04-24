@@ -40,9 +40,33 @@ Useful for manager-to-manager reactions and for any non-SwiftUI consumer that wa
 
 ### `SerialTask<Input, Output>`
 
-A `@MainActor` helper for "only one at a time" async work. The work closure is bound at construction; `run(_:)` fires it. While a task is in flight, further calls to `run(_:)` are skipped. An observable `isExecuting` flag is exposed for UI binding, and `cancel()` tears down the in-flight task.
+A `@MainActor` helper for "only one at a time" async work. The work closure is bound at construction; `run(_:)` fires it and awaits its output. While a task is in flight, further calls to `run(_:)` throw `SerialTask.AlreadyExecuting`. An observable `isExecuting` flag is exposed for UI binding, and `cancel()` tears down the in-flight task.
 
-`run(_:)` returns `Task<Output, Never>?` — `nil` when the call was skipped (either because one is already in flight, or because a weakly-held owner has been deallocated). Fire-and-forget callers ignore it; callers that want the value can `await task.run(input)?.value`. Void specializations collapse the input and/or output so they do not appear at call sites.
+The underlying `Task` is an implementation detail — callers interact only through `run(_:)`, `fire(_:)`, and `cancel()`.
+
+#### `run(_:) async throws -> Output`
+
+Awaits the work and returns its output. Throws:
+
+- `SerialTask.AlreadyExecuting` — a task is already in flight.
+- `SerialTask.OwnerDeallocated` — the `weak(_:)` factory's owner has been deallocated. Not thrown by the plain initializer or by `weak(_:default:)`.
+- `CancellationError` — the caller's task was cancelled, or `cancel()` was invoked externally while this run was in flight.
+
+The `try?` idiom collapses both "skip" cases to `nil`:
+
+```swift
+if let result = try? await loader.run() {
+    // work executed and produced `result`
+}
+```
+
+Callers who need to distinguish "already running" from "owner dead" use a typed `catch`.
+
+Caller cancellation propagates into the work closure: cancelling the awaiting task cancels the inner work via `withTaskCancellationHandler`.
+
+#### `fire(_:)`
+
+A synchronous, non-throwing, Void-returning wrapper that spawns a Task, awaits `run(_:)`, and swallows every outcome (AlreadyExecuting, OwnerDeallocated, CancellationError). Designed for SwiftUI call sites — button actions, `.onAppear`, etc. — where the surrounding context is not `async` and the caller only wants the side effect to happen if it can:
 
 ```swift
 @MainActor @Observable
@@ -52,22 +76,37 @@ final class SaveButtonModel {
     }
     var isSaving: Bool { saveTask.isExecuting }
 
-    func tap() { saveTask.run() }
+    func tap() { saveTask.fire() }
 }
 ```
 
-The `weak(_:)` convenience captures the owner weakly, passes the non-nil owner into the work closure (so the body can shadow-rebind it as `self` and read naturally), and skips execution (returning `nil` from `run(_:)`) if the owner has been deallocated. It is available for `Output == Void` — the common fire-and-forget UI shape. For non-Void `Output`, callers that want weak-self semantics capture `[weak self]` inside the work closure themselves and choose their own "owner is gone" return value.
+#### `weak(_:)` / `weak(_:default:)` factories
 
-A parameterized variant takes an input per call:
+Both capture `owner` weakly and pass the non-nil owner into the work closure (so the body can shadow-rebind it as `self` and read naturally). They differ in how they handle a deallocated owner:
+
+- **`weak(_:)`** — `run(_:)` throws `SerialTask.OwnerDeallocated`. Use for work with no meaningful fallback value; `fire(_:)` swallows the throw, and `try? await run(_:)` collapses to `nil`.
+- **`weak(_:default:)`** — `run(_:)` returns the provided default value instead. Use when the caller needs a guaranteed `Output` regardless of owner lifetime.
 
 ```swift
+// Void-output — typical UI fire-and-forget:
+let save = SerialTask.weak(self) { `self` in
+    await self.performSave()
+}
+
+// Non-Void output with a fallback:
+let fetchCount = SerialTask<Void, Int>.weak(self, default: 0) { `self` in
+    await self.currentCount()
+}
+
+// Parameterized:
 let saveItem = SerialTask<Item, Void>.weak(self) { `self`, item in
     await self.save(item)
 }
-saveItem.run(item)
 ```
 
-While a task is in flight, further `run(_:)` calls return `nil` immediately and are discarded — not queued, not coalesced, not replace-in-flight. "Replace the current work" is available explicitly via `cancel()` + `run(_:)`.
+#### Skip semantics
+
+While a task is in flight, further `run(_:)` calls throw `AlreadyExecuting` immediately — not queued, not coalesced, not replace-in-flight. "Replace the current work" is available explicitly via `cancel()` + `run(_:)`.
 
 Reach for this when the plain `guard !isSaving else { return }` pattern starts to repeat. Most screens do not need it.
 
