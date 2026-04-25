@@ -236,10 +236,10 @@ final class SerialTaskTests: XCTestCase {
 
         runTask.cancel()
 
-        // The onCancel handler must fire, propagating cancellation to the
-        // inner work task. Give it a moment to run.
-        await Task<Never, Never>.yield()
-        await Task<Never, Never>.yield()
+        // The onCancel handler spawns a fresh `Task { @MainActor in ... }`
+        // to do its increment, so a fixed number of yields can't guarantee
+        // it lands before we assert. Poll until it does (capped) instead.
+        await waitUntil { observedCancel.value >= 1 }
         XCTAssertGreaterThanOrEqual(observedCancel.value, 1)
 
         gate.open()
@@ -393,6 +393,206 @@ final class SerialTaskTests: XCTestCase {
         XCTAssertEqual(result, "fallback")
     }
 
+    // MARK: - Throwing work
+
+    func testThrowingWorkSuccessPath() async throws {
+        // A work closure declared as `throws` that does not actually throw
+        // behaves identically to a non-throwing closure.
+        let t = SerialTask<Void, Int> {
+            if false { throw TestError(code: 0) }
+            return 42
+        }
+        let value = try await t.run()
+        XCTAssertEqual(value, 42)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testThrowingWorkPropagatesErrorAndClearsIsExecuting() async {
+        let t = SerialTask<Void, Int> {
+            throw TestError(code: 7)
+        }
+        do {
+            _ = try await t.run()
+            XCTFail("Expected TestError")
+        } catch let error as TestError {
+            XCTAssertEqual(error.code, 7)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testThrowingWorkAllowsSubsequentRun() async throws {
+        // A failing run must not poison the task — the state machine
+        // resets and a subsequent run() proceeds as if nothing happened.
+        let counter = Counter()
+        let t = SerialTask<Void, Int> {
+            counter.increment()
+            if counter.value == 1 { throw TestError(code: 1) }
+            return counter.value
+        }
+        do {
+            _ = try await t.run()
+            XCTFail("Expected TestError on first run")
+        } catch is TestError {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertFalse(t.isExecuting)
+
+        let value = try await t.run()
+        XCTAssertEqual(value, 2)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testThrowingWorkWithInput() async {
+        let t = SerialTask<Int, Int> { input in
+            if input < 0 { throw TestError(code: input) }
+            return input * 2
+        }
+        do {
+            _ = try await t.run(-3)
+            XCTFail("Expected TestError")
+        } catch let error as TestError {
+            XCTAssertEqual(error.code, -3)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testSecondRunThrowsAlreadyExecutingWhileThrowingWorkInFlight() async throws {
+        // Serial-skip semantics must hold even when the in-flight work is
+        // on a path that will eventually throw.
+        let gate = Gate()
+        let t = SerialTask<Void, Void> {
+            await gate.wait()
+            throw TestError(code: 0)
+        }
+        let first = Task { try await t.run() }
+        await Task<Never, Never>.yield()
+        XCTAssertTrue(t.isExecuting)
+
+        do {
+            try await t.run()
+            XCTFail("Expected AlreadyExecuting")
+        } catch is SerialTask<Void, Void>.AlreadyExecuting {
+            // expected
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        gate.open()
+        do {
+            _ = try await first.value
+            XCTFail("Expected TestError from first run")
+        } catch is TestError {
+            // expected
+        } catch {
+            XCTFail("Unexpected error from first run: \(error)")
+        }
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testFireSwallowsWorkError() async {
+        // `fire()` is contracted to swallow every outcome. That contract
+        // must cover errors thrown by the work closure as well as the
+        // task's own control errors.
+        let attempts = Counter()
+        let t = SerialTask<Void, Void> {
+            attempts.increment()
+            throw TestError(code: 1)
+        }
+        t.fire()
+        await waitUntil { attempts.value == 1 }
+        await waitUntil { !t.isExecuting }
+        XCTAssertEqual(attempts.value, 1)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testNonThrowingClosureAcceptedByThrowingInit() async throws {
+        // The public init accepts `async throws -> Output`; passing a
+        // non-throwing closure literal must continue to compile and run
+        // because non-throwing is a subtype of throwing.
+        let t = SerialTask<Void, Int> { 9 }
+        let value = try await t.run()
+        XCTAssertEqual(value, 9)
+    }
+
+    func testVoidConvenienceInitAcceptsThrowingWork() async {
+        // The Input == Void convenience init's closure signature is
+        // `() async throws -> Output`.
+        let t = SerialTask<Void, Int> {
+            throw TestError(code: 5)
+        }
+        do {
+            _ = try await t.run()
+            XCTFail("Expected TestError")
+        } catch let error as TestError {
+            XCTAssertEqual(error.code, 5)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    // MARK: - weak(_:) with throwing work
+
+    func testWeakFactoryPropagatesWorkError() async {
+        let owner = WeakTestOwner()
+        let t = SerialTask<Void, Void>.weak(owner) { `self` in
+            self.saves += 1
+            throw TestError(code: 42)
+        }
+        do {
+            try await t.run()
+            XCTFail("Expected TestError")
+        } catch let error as TestError {
+            XCTAssertEqual(error.code, 42)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(owner.saves, 1)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testWeakWithDefaultPropagatesWorkErrorWhenOwnerAlive() async {
+        // `default:` substitutes only for owner-deallocation. When the
+        // owner is alive and the work closure throws, the error is
+        // surfaced unchanged.
+        let owner = WeakTestOwner()
+        let t = SerialTask<Void, Int>.weak(owner, default: -1) { `self` in
+            self.saves += 1
+            throw TestError(code: 99)
+        }
+        do {
+            _ = try await t.run()
+            XCTFail("Expected TestError")
+        } catch let error as TestError {
+            XCTAssertEqual(error.code, 99)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(owner.saves, 1)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testWeakWithDefaultShortCircuitsBeforeThrowingWorkRunsWhenOwnerDeallocated() async throws {
+        // Owner deallocation substitutes the default value without
+        // invoking the work closure, even if the work would have thrown.
+        let t: SerialTask<Void, Int> = {
+            var owner: WeakTestOwner? = WeakTestOwner()
+            let t = SerialTask<Void, Int>.weak(owner!, default: -1) { _ in
+                XCTFail("work must not run after owner dealloc")
+                throw TestError(code: 0)
+            }
+            owner = nil
+            return t
+        }()
+        let result = try await t.run()
+        XCTAssertEqual(result, -1)
+        XCTAssertFalse(t.isExecuting)
+    }
+
     // MARK: - Observation tracking
 
     func testIsExecutingIsObservable() async {
@@ -465,6 +665,10 @@ private final class Counter {
 @MainActor
 private final class WeakTestOwner {
     var saves: Int = 0
+}
+
+private struct TestError: Error, Equatable {
+    let code: Int
 }
 
 @MainActor

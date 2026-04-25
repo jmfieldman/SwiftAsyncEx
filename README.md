@@ -51,8 +51,22 @@ Awaits the work and returns its output. Throws:
 - `SerialTask.AlreadyExecuting` — a task is already in flight.
 - `SerialTask.OwnerDeallocated` — the `weak(_:)` factory's owner has been deallocated. Not thrown by the plain initializer or by `weak(_:default:)`.
 - `CancellationError` — the caller's task was cancelled, or `cancel()` was invoked externally while this run was in flight.
+- Any error thrown by the bound work closure itself.
 
-The `try?` idiom collapses both "skip" cases to `nil`:
+The work closure is typed `@MainActor (Input) async throws -> Output`. Non-throwing closures are accepted unchanged — a non-throwing closure is a subtype of a throwing one, so existing call sites keep compiling. Errors thrown by the work surface at `run(_:)` alongside the control errors above, so a single typed `catch` can distinguish them:
+
+```swift
+do {
+    let result = try await loader.run()
+    // ...
+} catch is SerialTask<Void, Value>.AlreadyExecuting {
+    // skipped — another run in flight
+} catch let error as MyDomainError {
+    // work failed with a domain error
+}
+```
+
+The `try?` idiom collapses **every** error path to `nil` — control errors and work-thrown errors alike:
 
 ```swift
 if let result = try? await loader.run() {
@@ -60,13 +74,11 @@ if let result = try? await loader.run() {
 }
 ```
 
-Callers who need to distinguish "already running" from "owner dead" use a typed `catch`.
-
 Caller cancellation propagates into the work closure: cancelling the awaiting task cancels the inner work via `withTaskCancellationHandler`.
 
 #### `fire(_:)`
 
-A synchronous, non-throwing, Void-returning wrapper that spawns a Task, awaits `run(_:)`, and swallows every outcome (AlreadyExecuting, OwnerDeallocated, CancellationError). Designed for SwiftUI call sites — button actions, `.onAppear`, etc. — where the surrounding context is not `async` and the caller only wants the side effect to happen if it can:
+A synchronous, non-throwing, Void-returning wrapper that spawns a Task, awaits `run(_:)`, and swallows every outcome — `AlreadyExecuting`, `OwnerDeallocated`, `CancellationError`, and any error thrown by the work closure. Designed for SwiftUI call sites — button actions, `.onAppear`, etc. — where the surrounding context is not `async` and the caller only wants the side effect to happen if it can:
 
 ```swift
 @MainActor @Observable
@@ -85,7 +97,7 @@ final class SaveButtonModel {
 Both capture `owner` weakly and pass the non-nil owner into the work closure (so the body can shadow-rebind it as `self` and read naturally). They differ in how they handle a deallocated owner:
 
 - **`weak(_:)`** — `run(_:)` throws `SerialTask.OwnerDeallocated`. Use for work with no meaningful fallback value; `fire(_:)` swallows the throw, and `try? await run(_:)` collapses to `nil`.
-- **`weak(_:default:)`** — `run(_:)` returns the provided default value instead. Use when the caller needs a guaranteed `Output` regardless of owner lifetime.
+- **`weak(_:default:)`** — `run(_:)` returns the provided default value instead. Use when the caller needs a guaranteed `Output` regardless of owner lifetime. The default only substitutes for owner deallocation — errors thrown by the work closure are re-thrown unchanged so the caller can still distinguish "owner gone" (default returned) from "work failed" (error thrown).
 
 ```swift
 // Void-output — typical UI fire-and-forget:

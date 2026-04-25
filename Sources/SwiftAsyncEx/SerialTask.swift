@@ -39,13 +39,13 @@ public final class SerialTask<Input, Output: Sendable>: Sendable {
     /// new run when the old tail eventually completes.
     @ObservationIgnored private var currentGeneration: UInt64 = 0
 
-    public init(_ work: @escaping @MainActor (Input) async -> Output) {
-        self.work = { input in await work(input) }
+    public init(_ work: @escaping @MainActor (Input) async throws -> Output) {
+        self.work = work
         self.ownerAlive = { true }
     }
 
     /// Internal initializer for factory helpers (e.g. `weak(_:)`) that need
-    /// to inject a throwing work closure and/or an owner-alive predicate.
+    /// to inject an owner-alive predicate alongside the work closure.
     internal init(
         work: @escaping @MainActor (Input) async throws -> Output,
         ownerAlive: @escaping @MainActor () -> Bool
@@ -62,6 +62,7 @@ public final class SerialTask<Input, Output: Sendable>: Sendable {
     ///   owner has been deallocated.
     /// - `CancellationError` if the caller's task is cancelled, or if
     ///   `cancel()` is invoked externally while this run is in flight.
+    /// - Any error thrown by the bound work closure.
     @discardableResult
     public func run(_ input: Input) async throws -> Output {
         guard !isExecuting else { throw AlreadyExecuting() }
@@ -123,8 +124,8 @@ public final class SerialTask<Input, Output: Sendable>: Sendable {
 // MARK: - Void-Input conveniences
 
 public extension SerialTask where Input == Void {
-    convenience init(_ work: @escaping @MainActor () async -> Output) {
-        self.init({ _ in await work() })
+    convenience init(_ work: @escaping @MainActor () async throws -> Output) {
+        self.init({ _ in try await work() })
     }
 
     @discardableResult
@@ -146,12 +147,12 @@ public extension SerialTask {
     /// `SerialTask.OwnerDeallocated`.
     static func weak<Owner: AnyObject>(
         _ owner: Owner,
-        _ work: @escaping @MainActor (Owner, Input) async -> Output
+        _ work: @escaping @MainActor (Owner, Input) async throws -> Output
     ) -> SerialTask<Input, Output> {
         SerialTask<Input, Output>(
             work: { [weak owner] input in
                 guard let owner else { throw SerialTask<Input, Output>.OwnerDeallocated() }
-                return await work(owner, input)
+                return try await work(owner, input)
             },
             ownerAlive: { [weak owner] in owner != nil }
         )
@@ -159,16 +160,18 @@ public extension SerialTask {
 
     /// Create a `SerialTask` whose work closure holds a weak reference to
     /// `owner`. If the owner has been deallocated, `run(_:)` returns
-    /// `defaultValue` instead of throwing.
+    /// `defaultValue` instead of throwing. Errors thrown by the work closure
+    /// itself are propagated unchanged — the default only substitutes for
+    /// owner deallocation.
     static func weak<Owner: AnyObject>(
         _ owner: Owner,
         default defaultValue: Output,
-        _ work: @escaping @MainActor (Owner, Input) async -> Output
+        _ work: @escaping @MainActor (Owner, Input) async throws -> Output
     ) -> SerialTask<Input, Output> {
         SerialTask<Input, Output>(
             work: { [weak owner] input in
                 guard let owner else { return defaultValue }
-                return await work(owner, input)
+                return try await work(owner, input)
             },
             ownerAlive: { true }
         )
@@ -179,12 +182,12 @@ public extension SerialTask where Input == Void {
     /// Void-input `weak(_:)` convenience.
     static func weak<Owner: AnyObject>(
         _ owner: Owner,
-        _ work: @escaping @MainActor (Owner) async -> Output
+        _ work: @escaping @MainActor (Owner) async throws -> Output
     ) -> SerialTask<Void, Output> {
         SerialTask<Void, Output>(
             work: { [weak owner] _ in
                 guard let owner else { throw SerialTask<Void, Output>.OwnerDeallocated() }
-                return await work(owner)
+                return try await work(owner)
             },
             ownerAlive: { [weak owner] in owner != nil }
         )
@@ -194,12 +197,12 @@ public extension SerialTask where Input == Void {
     static func weak<Owner: AnyObject>(
         _ owner: Owner,
         default defaultValue: Output,
-        _ work: @escaping @MainActor (Owner) async -> Output
+        _ work: @escaping @MainActor (Owner) async throws -> Output
     ) -> SerialTask<Void, Output> {
         SerialTask<Void, Output>(
             work: { [weak owner] _ in
                 guard let owner else { return defaultValue }
-                return await work(owner)
+                return try await work(owner)
             },
             ownerAlive: { true }
         )
