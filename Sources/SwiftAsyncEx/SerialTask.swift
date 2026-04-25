@@ -11,7 +11,7 @@ import Observation
 /// While a task is in flight, further calls to `run(_:)` throw
 /// `SerialTask.AlreadyExecuting`.
 ///
-/// `isExecuting` is observable — SwiftUI views and `Task.observe(of:)`
+/// `isExecuting` is observable — SwiftUI views and `Task.observe(expression:)`
 /// consumers can bind to it directly.
 ///
 /// The underlying `Task` is an implementation detail; callers interact only

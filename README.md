@@ -22,14 +22,14 @@ These are small things. The point of the rewrite-to-structured-concurrency story
 
 ## Contents
 
-### `Task.onChange(of:perform:) -> Task<Void, Never>`
+### `Task.observe(expression:perform:) -> Task<Void, Never>`
 
 An Observation-tracking helper that spawns a task which calls `perform` every time the value returned by the tracked expression changes. Hides the re-arm loop and the `willSet` / `Task.yield()` ordering problem.
 
-Exposed as a static factory on `Task` (consistent with `Task.bound(to:)` elsewhere in this library, and — pragmatically — avoids colliding with SwiftUI's `View.onChange(of:)` modifier in View-body scopes).
+Exposed as a static factory on `Task` (consistent with `Task.bound(to:)` elsewhere in this library).
 
 ```swift
-let task = Task.onChange(of: { manager.unreadCount }) { count in
+let task = Task.observe(expression: { manager.unreadCount }) { count in
     await badge.update(count)
 }
 // Cancel when you no longer want to observe:
@@ -363,9 +363,9 @@ Intended for per-key caches, per-ID fetches, and any pattern where "the same und
 
 1. **Thin over clever.** Each helper is small, readable, and does one thing. If a helper grows an options bag, it is probably two helpers.
 2. **No new paradigm.** The library does not introduce a stream type, a scheduler, or a reactive surface. Everything composes with plain `async`, `AsyncSequence`, `Task`, and `@Observable`.
-3. **Migration-aware.** Anywhere Swift or Foundation is about to ship a replacement, the helper is designed so its call sites migrate mechanically when the deployment floor rises. `Task.onChange` is the clearest example — it will be deletable in favor of `Observations { … }`.
+3. **Migration-aware.** Anywhere Swift or Foundation is about to ship a replacement, the helper is designed so its call sites migrate mechanically when the deployment floor rises. `Task.observe` is the clearest example — it will be deletable in favor of `Observations { … }`.
 4. **iOS 17 is the floor.** The library compiles and runs on iOS 17 / macOS 14 / tvOS 17 / watchOS 10 using only APIs available at that floor. Any use of a newer API (for example the iOS 26 `Observations` sequence) is gated behind `@available` with a working fallback on the floor; no public API requires a higher OS than the package minimum.
-5. **`@MainActor` where state and UI meet, `Sendable` elsewhere.** Helpers that expose observable state or are typically held by a view model / manager — `Task.onChange`, `SerialTask`, `TaskBag`, `MutableProperty`, `Property`, `PersistentProperty` — are MainActor-bound. Purely data-layer helpers — `AsyncDemuxer`, `ThrowingAsyncDemuxer`, `KeyedAsyncDemuxer`, `ThrowingKeyedAsyncDemuxer`, and the `PersistentPropertyStorageEngine` implementations — are `Sendable` and actor-agnostic; they are safe to hold inside a MainActor container and to invoke from any isolation context.
+5. **`@MainActor` where state and UI meet, `Sendable` elsewhere.** Helpers that expose observable state or are typically held by a view model / manager — `Task.observe`, `SerialTask`, `TaskBag`, `MutableProperty`, `Property`, `PersistentProperty` — are MainActor-bound. Purely data-layer helpers — `AsyncDemuxer`, `ThrowingAsyncDemuxer`, `KeyedAsyncDemuxer`, `ThrowingKeyedAsyncDemuxer`, and the `PersistentPropertyStorageEngine` implementations — are `Sendable` and actor-agnostic; they are safe to hold inside a MainActor container and to invoke from any isolation context.
 
 ## Non-goals
 

@@ -126,7 +126,7 @@ final class PersistentPropertyTests: XCTestCase {
             defaultValue: 0
         )
         let (stream, cont) = AsyncStream<Int>.makeStream()
-        let obs = Task.observe(of: { p.value }, emitInitial: false) { v in cont.yield(v) }
+        let obs = Task.observe(emitInitial: false, expression: { p.value }) { v in cont.yield(v) }
         await Task<Never, Never>.yield()
 
         p.value = 10
@@ -152,7 +152,7 @@ final class PersistentPropertyTests: XCTestCase {
         )
         let (stream, cont) = AsyncStream<Bool>.makeStream()
         // Observe whether the error is non-nil.
-        let obs = Task.observe(of: { p.error != nil }, emitInitial: false) { hasError in
+        let obs = Task.observe(emitInitial: false, expression: { p.error != nil }) { hasError in
             cont.yield(hasError)
         }
         await Task<Never, Never>.yield()

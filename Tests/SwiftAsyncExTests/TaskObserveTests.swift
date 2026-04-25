@@ -37,7 +37,7 @@ final class TaskObserveTests: XCTestCase {
         model.count = 5
         let (stream, cont) = AsyncStream<Int>.makeStream()
 
-        let task = Task.observe(of: { model.count }) { new in
+        let task = Task.observe(expression: { model.count }) { new in
             cont.yield(new)
         }
 
@@ -54,7 +54,7 @@ final class TaskObserveTests: XCTestCase {
         model.count = 5
         let fireCount = FireCounter()
 
-        let task = Task.observe(of: { model.count }, emitInitial: false) { _ in
+        let task = Task.observe(emitInitial: false, expression: { model.count }) { _ in
             fireCount.increment()
         }
 
@@ -71,7 +71,7 @@ final class TaskObserveTests: XCTestCase {
         let model = TestModel()
         let (stream, cont) = AsyncStream<Int>.makeStream()
 
-        let task = Task.observe(of: { model.count }, emitInitial: false) { new in
+        let task = Task.observe(emitInitial: false, expression: { model.count }) { new in
             cont.yield(new)
         }
 
@@ -101,7 +101,7 @@ final class TaskObserveTests: XCTestCase {
         let model = TestModel()
         let (stream, cont) = AsyncStream<Int>.makeStream()
 
-        let task = Task.observe(of: { model.count }, emitInitial: false) { new in
+        let task = Task.observe(emitInitial: false, expression: { model.count }) { new in
             cont.yield(new)
         }
 
@@ -139,9 +139,9 @@ final class TaskObserveTests: XCTestCase {
         let (stream, cont) = AsyncStream<Int>.makeStream()
 
         let task = Task.observe(
-            of: { model.count },
             emitInitial: true,
-            removeDuplicates: false
+            removeDuplicates: false,
+            expression: { model.count }
         ) { new in
             cont.yield(new)
         }
@@ -166,9 +166,9 @@ final class TaskObserveTests: XCTestCase {
 
         // Dedup by tag: equal tags suppress delivery.
         let task = Task.observe(
-            of: { holder.payload },
             emitInitial: false,
-            removeDuplicates: { $0.tag == $1.tag }
+            removeDuplicates: { $0.tag == $1.tag },
+            expression: { holder.payload }
         ) { payload in
             cont.yield(payload.tag)
         }
@@ -198,8 +198,8 @@ final class TaskObserveTests: XCTestCase {
         let (stream, cont) = AsyncStream<String>.makeStream()
 
         let task = Task.observe(
-            of: { holder.payload },
-            emitInitial: false
+            emitInitial: false,
+            expression: { holder.payload }
         ) { payload in
             cont.yield(payload.tag)
         }
@@ -272,8 +272,8 @@ final class TaskObserveTests: XCTestCase {
         let (stream, cont) = AsyncStream<String>.makeStream()
 
         let task = Task.observe(
-            of: { "\(model.count):\(model.name)" },
-            emitInitial: false
+            emitInitial: false,
+            expression: { "\(model.count):\(model.name)" }
         ) { new in
             cont.yield(new)
         }
@@ -297,7 +297,7 @@ final class TaskObserveTests: XCTestCase {
 
     func testCancelReturnsEvenWithoutMutation() async {
         let model = TestModel()
-        let task = Task.observe(of: { model.count }, emitInitial: false) { _ in }
+        let task = Task.observe(emitInitial: false, expression: { model.count }) { _ in }
 
         await Task.yield()
         task.cancel()
@@ -309,7 +309,7 @@ final class TaskObserveTests: XCTestCase {
         let model = TestModel()
         let fireCount = FireCounter()
 
-        let task = Task.observe(of: { model.count }, emitInitial: false) { _ in
+        let task = Task.observe(emitInitial: false, expression: { model.count }) { _ in
             fireCount.increment()
         }
 
@@ -341,9 +341,9 @@ final class TaskObserveTests: XCTestCase {
         weak let weakOwner = owner
 
         let task = Task.observe(
-            of: { model.count },
             emitInitial: false,
-            bindTo: owner
+            bindTo: owner,
+            expression: { model.count }
         ) { _ in
             fireCount.increment()
         }
@@ -375,9 +375,9 @@ final class TaskObserveTests: XCTestCase {
         let (stream, cont) = AsyncStream<Int>.makeStream()
 
         Task.observe(
-            of: { model.count },
             emitInitial: false,
-            bindTo: bag
+            bindTo: bag,
+            expression: { model.count }
         ) { new in
             cont.yield(new)
         }
@@ -403,9 +403,9 @@ final class TaskObserveTests: XCTestCase {
     func testEquatableOverloadResolvesForEquatableT() async {
         let model = TestModel()
         let task = Task.observe(
-            of: { model.count },
             emitInitial: false,
-            removeDuplicates: false
+            removeDuplicates: false,
+            expression: { model.count }
         ) { _ in }
         task.cancel()
     }

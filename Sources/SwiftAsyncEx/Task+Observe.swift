@@ -22,8 +22,6 @@ extension Task where Success == Void, Failure == Never {
     /// underlying writes.
     ///
     /// - Parameters:
-    ///   - expression: The value to observe. Every `@Observable` property read
-    ///     inside registers tracking.
     ///   - emitInitial: When `true` (default), `perform` runs once with the
     ///     initial value before the observation loop starts.
     ///   - removeDuplicates: When `true` (default), consecutive projected
@@ -31,20 +29,22 @@ extension Task where Success == Void, Failure == Never {
     ///   - bindTo: If non-nil, the returned task is bound to the owner's
     ///     associated `TaskBag` (or directly to a passed `TaskBag`) and
     ///     cancelled when that owner deallocates.
+    ///   - expression: The value to observe. Every `@Observable` property read
+    ///     inside registers tracking.
     ///   - perform: Called on MainActor for each qualifying value.
     /// - Returns: The spawned task, cancellable or bindable post-hoc.
     @MainActor
     @discardableResult
     public static func observe<T: Equatable>(
-        of expression: @escaping @MainActor () -> T,
         emitInitial: Bool = true,
         removeDuplicates: Bool = true,
         bindTo: AnyObject? = nil,
+        expression: @escaping @MainActor () -> T,
         perform: @escaping @MainActor (T) async -> Void
     ) -> Task<Void, Never> {
         let isDuplicate: ((T, T) -> Bool)? = removeDuplicates ? { $0 == $1 } : nil
         return observeImpl(
-            track: { expression() },
+            expression: { expression() },
             emitInitial: emitInitial,
             isDuplicate: isDuplicate,
             bindTo: bindTo,
@@ -60,13 +60,13 @@ extension Task where Success == Void, Failure == Never {
     @MainActor
     @discardableResult
     public static func observe<T>(
-        of expression: @escaping @MainActor () -> T,
         emitInitial: Bool = true,
         bindTo: AnyObject? = nil,
+        expression: @escaping @MainActor () -> T,
         perform: @escaping @MainActor (T) async -> Void
     ) -> Task<Void, Never> {
         observeImpl(
-            track: { expression() },
+            expression: { expression() },
             emitInitial: emitInitial,
             isDuplicate: nil,
             bindTo: bindTo,
@@ -82,14 +82,14 @@ extension Task where Success == Void, Failure == Never {
     @MainActor
     @discardableResult
     public static func observe<T>(
-        of expression: @escaping @MainActor () -> T,
         emitInitial: Bool = true,
         removeDuplicates isDuplicate: @escaping (T, T) -> Bool,
         bindTo: AnyObject? = nil,
+        expression: @escaping @MainActor () -> T,
         perform: @escaping @MainActor (T) async -> Void
     ) -> Task<Void, Never> {
         observeImpl(
-            track: { expression() },
+            expression: { expression() },
             emitInitial: emitInitial,
             isDuplicate: isDuplicate,
             bindTo: bindTo,
@@ -116,7 +116,7 @@ extension Task where Success == Void, Failure == Never {
     ) -> Task<Void, Never> {
         let isDuplicate: ((T, T) -> Bool)? = removeDuplicates ? { $0 == $1 } : nil
         return observeImpl(
-            track: { [weak root] in root.map { $0[keyPath: keyPath] } },
+            expression: { [weak root] in root.map { $0[keyPath: keyPath] } },
             emitInitial: emitInitial,
             isDuplicate: isDuplicate,
             bindTo: bindTo,
@@ -138,7 +138,7 @@ extension Task where Success == Void, Failure == Never {
         perform: @escaping @MainActor (T) async -> Void
     ) -> Task<Void, Never> {
         observeImpl(
-            track: { [weak root] in root.map { $0[keyPath: keyPath] } },
+            expression: { [weak root] in root.map { $0[keyPath: keyPath] } },
             emitInitial: emitInitial,
             isDuplicate: nil,
             bindTo: bindTo,
@@ -148,19 +148,19 @@ extension Task where Success == Void, Failure == Never {
 
     // MARK: - Internal pump
 
-    /// Shared observation pump. `track` returns `nil` to signal that the
+    /// Shared observation pump. `expression` returns `nil` to signal that the
     /// underlying subject is gone (e.g. a weak root was deallocated) and the
     /// loop should exit cleanly.
     @MainActor
     private static func observeImpl<T>(
-        track: @escaping @MainActor () -> T?,
+        expression: @escaping @MainActor () -> T?,
         emitInitial: Bool,
         isDuplicate: ((T, T) -> Bool)?,
         bindTo: AnyObject?,
         perform: @escaping @MainActor (T) async -> Void
     ) -> Task<Void, Never> {
         let task = Task { @MainActor in
-            guard var last = track() else { return }
+            guard var last = expression() else { return }
             if emitInitial { await perform(last) }
             if Task<Never, Never>.isCancelled { return }
 
@@ -168,7 +168,7 @@ extension Task where Success == Void, Failure == Never {
                 let box = ObservationContinuationBox()
                 var subjectAlive = true
                 withObservationTracking {
-                    if track() == nil { subjectAlive = false }
+                    if expression() == nil { subjectAlive = false }
                 } onChange: {
                     box.resume()
                 }
@@ -186,7 +186,7 @@ extension Task where Success == Void, Failure == Never {
                 // `withObservationTracking` fires on `willSet`; yield so the
                 // setter's actual commit happens before we re-read the value.
                 await Task<Never, Never>.yield()
-                guard let new = track() else { break }
+                guard let new = expression() else { break }
                 if let isDuplicate, isDuplicate(last, new) { continue }
                 last = new
                 await perform(new)
