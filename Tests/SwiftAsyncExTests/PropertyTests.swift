@@ -100,6 +100,30 @@ final class PropertyTests: XCTestCase {
         cont.finish()
     }
 
+    // MARK: - AsyncSequence init (Optional lift)
+
+    func testInitFromAsyncSequenceOptionalStartsNil() {
+        let (stream, _) = AsyncStream<Int>.makeStream()
+        let p: Property<Int?> = Property(from: stream)
+        XCTAssertNil(p.value)
+    }
+
+    func testInitFromAsyncSequenceOptionalUpdates() async {
+        let (stream, cont) = AsyncStream<Int>.makeStream()
+        let p: Property<Int?> = Property(from: stream)
+        XCTAssertNil(p.value)
+
+        cont.yield(7)
+        try? await waitForValue(p, equalTo: 7)
+        XCTAssertEqual(p.value, 7)
+
+        cont.yield(13)
+        try? await waitForValue(p, equalTo: 13)
+        XCTAssertEqual(p.value, 13)
+
+        cont.finish()
+    }
+
     // MARK: - asAsyncSequence
 
     func testAsAsyncSequenceYieldsInitialValue() async {

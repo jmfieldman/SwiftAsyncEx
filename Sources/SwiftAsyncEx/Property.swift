@@ -96,6 +96,27 @@ public final class Property<Value: Sendable>: PropertyProtocol {
         }
     }
 
+    /// Seed with `nil`, then update from `source` as elements arrive, lifting
+    /// each into `Optional`. Convenience for the common case of bridging an
+    /// `AsyncSequence<T>` into a `Property<T?>` without an initial value.
+    ///
+    /// If `source` terminates (by finishing or throwing), the pump simply
+    /// stops; the last-seen value remains. Thrown errors are not surfaced.
+    public init<S: AsyncSequence & Sendable, Element: Sendable>(
+        from source: S
+    ) where S.Element == Element, Value == Element? {
+        self.value = nil
+        Task.bound(to: self) { @MainActor [weak self] in
+            do {
+                for try await element in source {
+                    self?.value = element
+                }
+            } catch {
+                // Source terminated with error; pump stops.
+            }
+        }
+    }
+
     // MARK: - Internal pump
 
     /// Spawn an observation-tracking pump bound to this Property's lifetime.
