@@ -56,6 +56,13 @@ extension MutablePropertyProtocol {
     public nonisolated func set(_ newValue: Value) async {
         await MainActor.run { self.value = newValue }
     }
+
+    /// Mutate the value from any isolation context. Hops to MainActor
+    /// internally, then performs the read-modify-write without suspension so
+    /// competing writes cannot interleave between the read and write.
+    public nonisolated func update(_ block: @escaping @Sendable (inout Value) -> Void) async {
+        await MainActor.run { self.modify(block) }
+    }
 }
 
 // MARK: - AsyncSequence bridge

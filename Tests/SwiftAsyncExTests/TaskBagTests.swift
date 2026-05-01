@@ -76,16 +76,25 @@ final class TaskBagTests: XCTestCase {
 
     func testTaskIsPrunedFromBagOnCompletion() async {
         let bag = TaskBag()
-        let task = Task { "done" }
+        let (stream, continuation) = AsyncStream<Void>.makeStream()
+        let task = Task {
+            for await _ in stream { break }
+            return "done"
+        }
         bag.insert(task)
         XCTAssertEqual(bag.count, 1)
 
-        _ = await task.value
+        continuation.yield(())
+        continuation.finish()
+        let result = await task.value
+        XCTAssertEqual(result, "done")
 
-        // Pruning happens via an observer Task; wait for it.
-        for _ in 0..<200 {
+        // Pruning happens via an observer Task; wait for it with a bounded
+        // timeout so the assertion is not tied to a fixed number of yields.
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline {
             if bag.count == 0 { break }
-            await Task.yield()
+            try? await Task.sleep(nanoseconds: 1_000_000)
         }
         XCTAssertEqual(bag.count, 0)
     }

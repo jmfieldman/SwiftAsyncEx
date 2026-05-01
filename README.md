@@ -206,7 +206,7 @@ The consumer's interface is `any PropertyProtocol<Int>` — any class that can p
 
 #### `MutableProperty<Value>`
 
-An `@Observable @MainActor` single-value box. Read and write through `.value`; use `modify(_:)` for atomic in-place mutation of collection / struct values. Cross-actor `set(_:) async` / `read() async` helpers let background tasks update the value without `await MainActor.run { ... }` ceremony at the call site.
+An `@Observable @MainActor` single-value box. Read and write through `.value`; use `modify(_:)` for atomic in-place mutation of collection / struct values. Cross-actor `set(_:) async`, `read() async`, and `update(_:) async` helpers let background tasks read, write, and mutate the value without `await MainActor.run { ... }` ceremony at the call site.
 
 #### `Property<Value>` constructors
 

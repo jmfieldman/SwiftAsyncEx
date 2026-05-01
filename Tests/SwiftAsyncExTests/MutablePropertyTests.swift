@@ -70,6 +70,16 @@ final class MutablePropertyTests: XCTestCase {
         XCTAssertEqual(v, 7)
     }
 
+    nonisolated func testUpdateFromBackgroundTask() async {
+        let p = await MainActor.run { MutableProperty<[Int]>([]) }
+        await Task.detached {
+            await p.update { $0.append(1) }
+            await p.update { $0.append(2) }
+        }.value
+        let v = await MainActor.run { p.value }
+        XCTAssertEqual(v, [1, 2])
+    }
+
     nonisolated func testSequentialSetsFromBackgroundArriveInOrder() async {
         let p = await MainActor.run { MutableProperty(0) }
         await Task.detached {
