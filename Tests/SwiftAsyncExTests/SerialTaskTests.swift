@@ -393,6 +393,79 @@ final class SerialTaskTests: XCTestCase {
         XCTAssertEqual(result, "fallback")
     }
 
+    // MARK: - weak(_:) — Optional output substitutes nil
+
+    func testWeakOptionalRunsWhenOwnerAlive() async throws {
+        let owner = WeakTestOwner()
+        let t = SerialTask<Void, Int?>.weak(owner) { `self` in
+            self.saves += 1
+            return self.saves
+        }
+        let result = try await t.run()
+        XCTAssertEqual(result, 1)
+    }
+
+    func testWeakOptionalReturnsNilWhenOwnerDeallocated() async throws {
+        let t: SerialTask<Void, Int?> = {
+            var owner: WeakTestOwner? = WeakTestOwner()
+            let t = SerialTask<Void, Int?>.weak(owner!) { `self` in
+                self.saves += 1
+                return self.saves
+            }
+            owner = nil
+            return t
+        }()
+        let result = try await t.run()
+        XCTAssertNil(result)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testWeakOptionalWithInputReturnsNilWhenOwnerDeallocated() async throws {
+        let t: SerialTask<Int, String?> = {
+            var owner: WeakTestOwner? = WeakTestOwner()
+            let t = SerialTask<Int, String?>.weak(owner!) { _, _ in
+                "real"
+            }
+            owner = nil
+            return t
+        }()
+        let result = try await t.run(42)
+        XCTAssertNil(result)
+    }
+
+    func testWeakOptionalPropagatesWorkErrorWhenOwnerAlive() async {
+        let owner = WeakTestOwner()
+        let t = SerialTask<Void, Int?>.weak(owner) { `self` in
+            self.saves += 1
+            throw TestError(code: 17)
+        }
+        do {
+            _ = try await t.run()
+            XCTFail("Expected TestError")
+        } catch let error as TestError {
+            XCTAssertEqual(error.code, 17)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(owner.saves, 1)
+        XCTAssertFalse(t.isExecuting)
+    }
+
+    func testWeakOptionalShortCircuitsBeforeWorkRunsWhenOwnerDeallocated() async throws {
+        let t: SerialTask<Void, Int?> = {
+            var owner: WeakTestOwner? = WeakTestOwner()
+            let t = SerialTask<Void, Int?>.weak(owner!) { _ in
+                XCTFail("work must not run after owner dealloc")
+                return 0
+            }
+            owner = nil
+            return t
+        }()
+        let result = try await t.run()
+        XCTAssertNil(result)
+        XCTAssertFalse(t.isExecuting)
+    }
+
     // MARK: - Throwing work
 
     func testThrowingWorkSuccessPath() async throws {

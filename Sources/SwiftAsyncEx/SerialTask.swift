@@ -176,6 +176,23 @@ public extension SerialTask {
             ownerAlive: { true }
         )
     }
+
+    /// Create a `SerialTask` whose work closure holds a weak reference to
+    /// `owner`, for an `Optional` output. If the owner has been deallocated,
+    /// `run(_:)` returns `nil` instead of throwing. Errors thrown by the work
+    /// closure itself are propagated unchanged.
+    static func weak<Owner: AnyObject, Wrapped>(
+        _ owner: Owner,
+        _ work: @escaping @MainActor (Owner, Input) async throws -> Output
+    ) -> SerialTask<Input, Output> where Output == Wrapped? {
+        SerialTask<Input, Output>(
+            work: { [weak owner] input in
+                guard let owner else { return nil }
+                return try await work(owner, input)
+            },
+            ownerAlive: { true }
+        )
+    }
 }
 
 public extension SerialTask where Input == Void {
@@ -202,6 +219,22 @@ public extension SerialTask where Input == Void {
         SerialTask<Void, Output>(
             work: { [weak owner] _ in
                 guard let owner else { return defaultValue }
+                return try await work(owner)
+            },
+            ownerAlive: { true }
+        )
+    }
+
+    /// Void-input convenience for the `Optional`-output `weak(_:)` overload.
+    /// If the owner has been deallocated, `run()` returns `nil` instead of
+    /// throwing.
+    static func weak<Owner: AnyObject, Wrapped>(
+        _ owner: Owner,
+        _ work: @escaping @MainActor (Owner) async throws -> Output
+    ) -> SerialTask<Void, Output> where Output == Wrapped? {
+        SerialTask<Void, Output>(
+            work: { [weak owner] _ in
+                guard let owner else { return nil }
                 return try await work(owner)
             },
             ownerAlive: { true }
