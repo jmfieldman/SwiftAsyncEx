@@ -4,6 +4,7 @@
 //
 
 import XCTest
+import Observation
 
 @testable import SwiftAsyncEx
 
@@ -35,6 +36,19 @@ final class PropertyTests: XCTestCase {
         source.value = 2
         try? await waitForValue(p, equalTo: 2)
         XCTAssertEqual(p.value, 2)
+    }
+
+    func testMirroringUpdatesSynchronouslyOnMainThread() throws {
+        guard #available(macOS 27, *) else {
+            throw XCTSkip("Synchronous didSet propagation requires macOS 27")
+        }
+
+        let source = MutableProperty(0)
+        let mirror = Property(mirroring: source)
+
+        source.value = 1
+
+        XCTAssertEqual(mirror.value, 1)
     }
 
     func testMirroringReadOnlyFromConsumerPerspective() {
@@ -80,6 +94,87 @@ final class PropertyTests: XCTestCase {
         b.value = 100
         try? await waitForValue(sum, equalTo: 105)
         XCTAssertEqual(sum.value, 105)
+    }
+
+    func testTrackingClosureUpdatesSynchronouslyOnMainThread() throws {
+        guard #available(macOS 27, *) else {
+            throw XCTSkip("Synchronous didSet propagation requires macOS 27")
+        }
+
+        let source = MutableProperty(2)
+        let doubled = Property(tracking: { source.value * 2 })
+
+        source.value = 3
+
+        XCTAssertEqual(doubled.value, 6)
+    }
+
+    func testTrackingClosureCatchesUpAfterRapidBackgroundMutations() async throws {
+        let source = LockedObservableInt(0)
+        let doubled = Property(tracking: { source.value * 2 })
+
+        let backgroundWriter = Task.detached {
+            for value in 1...500 {
+                source.value = value
+            }
+        }
+
+        // Interleave writes from MainActor while the detached writer is
+        // producing changes. The source lock makes these reads and writes
+        // safe regardless of which thread wins each individual write.
+        for value in 501...550 {
+            source.value = value
+            if value.isMultiple(of: 5) {
+                await Task<Never, Never>.yield()
+            }
+        }
+        await backgroundWriter.value
+
+        // Establish a deterministic final write after both writers finish.
+        source.value = 999
+        try await waitForValue(doubled, equalTo: 1_998)
+        XCTAssertEqual(doubled.value, 1_998)
+    }
+
+    func testTrackingClosureReadsLatestValueAfterOffMainBurst() async throws {
+        let source = LockedObservableInt(0)
+        let projected = Property(tracking: { "value=\(source.value)" })
+
+        let writer = Task.detached {
+            source.value = 1
+            source.value = 2
+            source.value = 3
+            source.value = 4
+        }
+        await writer.value
+
+        try await waitForValue(projected, equalTo: "value=4")
+        XCTAssertEqual(projected.value, "value=4")
+    }
+
+    func testTrackingClosureRebindsConditionalDependencyAcrossThreads() async throws {
+        let selectedSource = LockedObservableInt(0)
+        let firstSource = LockedObservableInt(10)
+        let secondSource = LockedObservableInt(20)
+        let selected = Property(tracking: {
+            selectedSource.value == 0 ? firstSource.value : secondSource.value
+        })
+
+        let backgroundWriter = Task.detached {
+            for value in 11...210 {
+                firstSource.value = value
+                secondSource.value = value * 2
+            }
+        }
+
+        // Change which dependency the closure reads while the background
+        // writer is updating both sources.
+        selectedSource.value = 1
+        await backgroundWriter.value
+        secondSource.value = 999
+
+        try await waitForValue(selected, equalTo: 999)
+        XCTAssertEqual(selected.value, 999)
     }
 
     // MARK: - AsyncSequence init
@@ -175,6 +270,31 @@ final class PropertyTests: XCTestCase {
                 code: 0,
                 userInfo: [NSLocalizedDescriptionKey: "Property did not reach \(target); last value = \(property.value)"]
             )
+        }
+    }
+}
+
+/// A small `Observable` source whose storage can safely be changed from both
+/// MainActor and detached tasks. The lock protects the value; the registrar
+/// reports accesses and mutations to Observation.
+private final class LockedObservableInt: Observable, @unchecked Sendable {
+    private let registrar = ObservationRegistrar()
+    private let lock = NSLock()
+    private var storedValue: Int
+
+    init(_ value: Int) {
+        storedValue = value
+    }
+
+    var value: Int {
+        get {
+            registrar.access(self, keyPath: \.value)
+            return lock.withLock { storedValue }
+        }
+        set {
+            registrar.withMutation(of: self, keyPath: \.value) {
+                lock.withLock { storedValue = newValue }
+            }
         }
     }
 }

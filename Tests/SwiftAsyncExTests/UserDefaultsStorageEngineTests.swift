@@ -136,6 +136,7 @@ final class UserDefaultsStorageEngineTests: XCTestCase {
 
     func testIntegratesWithPersistentProperty() async throws {
         let key = PersistentPropertyKey(key: "integrated")
+        let engine = self.engine!
         // Seed a value so init picks it up.
         try engine.store(value: 7, key: key)
 

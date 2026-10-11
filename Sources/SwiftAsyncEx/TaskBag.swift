@@ -113,7 +113,7 @@ extension TaskBag {
 /// `Task` to the entry. If `cancel()` is invoked before `setTask(_:)` (e.g.,
 /// a concurrent `cancelAll()` on the bag), cancellation intent is recorded and
 /// applied as soon as the task is wired up.
-internal final class TaskCancelToken<Success, Failure: Error>: @unchecked Sendable {
+internal final class TaskCancelToken<Success: Sendable, Failure: Error>: @unchecked Sendable {
     private let lock = NSLock()
     private var task: Task<Success, Failure>?
     private var cancelPending = false

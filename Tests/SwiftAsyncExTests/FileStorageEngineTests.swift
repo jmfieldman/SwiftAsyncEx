@@ -179,6 +179,7 @@ final class FileStorageEngineTests: XCTestCase {
     // MARK: - PersistentProperty integration
 
     func testIntegratesWithPersistentProperty() async throws {
+        let engine = self.engine!
         let p = await MainActor.run {
             PersistentProperty(
                 storageEngine: engine,
@@ -195,6 +196,7 @@ final class FileStorageEngineTests: XCTestCase {
     }
 
     func testPersistentPropertyRoundtripsThroughRestart() async throws {
+        let engine = self.engine!
         let key = PersistentPropertyKey(key: "k")
         do {
             let p = await MainActor.run {

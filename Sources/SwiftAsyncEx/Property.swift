@@ -6,6 +6,58 @@
 import Foundation
 import Observation
 
+/// Use post-mutation observation where the runtime provides it. The package
+/// keeps its existing deployment targets, so older OS versions fall back to
+/// Observation's original willSet callback.
+@MainActor
+private func trackedPropertyRead<Value>(
+    _ read: @MainActor () -> Value,
+    onChange: @escaping @Sendable () -> Void
+) -> Value {
+    if #available(iOS 27, macOS 27, tvOS 27, watchOS 27, *) {
+        return withObservationTracking(options: [.didSet], read, onChange: { _ in
+            onChange()
+        })
+    }
+    return withObservationTracking(read, onChange: {
+        // The legacy callback is willSet. Let the setter commit before
+        // reading and publishing the new value.
+        Task { @MainActor in
+            await Task<Never, Never>.yield()
+            onChange()
+        }
+    })
+}
+
+/// The Property owns its refresh handler. Observation callbacks hold this
+/// box weakly, avoiding a source -> callback -> source retain cycle.
+private final class PropertyObservationHandler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable () -> Void)?
+    private var changePending = false
+
+    func install(_ handler: @escaping @Sendable () -> Void) {
+        let fireNow = lock.withLock {
+            self.handler = handler
+            let pending = changePending
+            changePending = false
+            return pending
+        }
+        if fireNow { handler() }
+    }
+
+    func fire() {
+        let callback: (@Sendable () -> Void)? = lock.withLock {
+            guard let handler else {
+                changePending = true
+                return nil
+            }
+            return handler
+        }
+        callback?()
+    }
+}
+
 /// A read-only observable handle over a value. Hand one of these out when a
 /// consumer should be able to observe your value but not mutate it, and
 /// should not need to hold onto your concrete producer type.
@@ -21,14 +73,17 @@ import Observation
 /// - `Property(initial:from:)` — seed an initial value and then follow an
 ///   `AsyncSequence`.
 ///
-/// Mirror- and tracking-mode updates lag the source by one runloop tick
-/// (Observation's `onChange` fires on `willSet`; the internal pump yields
-/// before re-reading so the committed value is the one propagated).
+/// On supported runtimes, main-thread mirror- and tracking-mode mutations
+/// propagate synchronously after the source commits. Other mutations are
+/// refreshed on the main actor.
 @Observable
 @MainActor
 public final class Property<Value: Sendable>: PropertyProtocol {
     /// The current value.
     public private(set) var value: Value
+
+    @ObservationIgnored
+    private var observationHandler: PropertyObservationHandler?
 
     // MARK: - Constant
 
@@ -51,8 +106,13 @@ public final class Property<Value: Sendable>: PropertyProtocol {
     /// lifetime, so `source` stays alive as long as consumers hold this
     /// Property.
     public init(mirroring source: some PropertyProtocol<Value>) {
-        self.value = source.value
-        startObservationPump { source.value }
+        let read: @MainActor @Sendable () -> Value = { source.value }
+        let handler = PropertyObservationHandler()
+        self.value = trackedPropertyRead(read, onChange: { [weak handler] in
+            handler?.fire()
+        })
+        self.observationHandler = handler
+        installRefreshHandler(handler, read: read)
     }
 
     // MARK: - Track an Observation-reading closure
@@ -67,8 +127,12 @@ public final class Property<Value: Sendable>: PropertyProtocol {
     /// to be a separate handle, a computed property on a containing
     /// `@Observable` is strictly better.
     public init(tracking closure: @escaping @MainActor @Sendable () -> Value) {
-        self.value = closure()
-        startObservationPump(closure)
+        let handler = PropertyObservationHandler()
+        self.value = trackedPropertyRead(closure, onChange: { [weak handler] in
+            handler?.fire()
+        })
+        self.observationHandler = handler
+        installRefreshHandler(handler, read: closure)
     }
 
     // MARK: - Initial value + AsyncSequence
@@ -117,47 +181,37 @@ public final class Property<Value: Sendable>: PropertyProtocol {
         }
     }
 
-    // MARK: - Internal pump
+    // MARK: - Observation refresh
 
-    /// Spawn an observation-tracking pump bound to this Property's lifetime.
-    /// `read` is invoked under `withObservationTracking`, so any `@Observable`
-    /// state it accesses is tracked; on change, `self.value` is updated to
-    /// the new reading.
-    private func startObservationPump(_ read: @escaping @MainActor () -> Value) {
-        Task.bound(to: self) { @MainActor [weak self] in
-            while !Task<Never, Never>.isCancelled {
-                let box = ObservationContinuationBox()
-
-                // Arm observation and sync to the current value. The strong
-                // `self` reference is scoped to this closure so it is
-                // released before the `await` below — otherwise the pump
-                // body would keep `self` alive indefinitely and break
-                // lifetime-bound cancellation.
-                let armed: Bool = {
-                    guard let strong = self else { return false }
-                    strong.value = read()
-                    withObservationTracking {
-                        _ = read()
-                    } onChange: {
-                        box.resume()
-                    }
-                    return true
-                }()
-                guard armed else { break }
-
-                await withTaskCancellationHandler {
-                    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                        box.setContinuation(cont)
-                    }
-                } onCancel: {
-                    box.resume()
+    private func installRefreshHandler(
+        _ handler: PropertyObservationHandler,
+        read: @escaping @MainActor @Sendable () -> Value
+    ) {
+        handler.install { [weak self, weak handler] in
+            guard let handler else { return }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    self?.refreshAndRearm(using: handler, read: read)
                 }
-
-                if Task<Never, Never>.isCancelled { break }
-                // Let the source's willSet commit before the next iteration
-                // reads the new value.
-                await Task<Never, Never>.yield()
+            } else {
+                Task { @MainActor [weak self, weak handler] in
+                    guard let self, let handler else { return }
+                    self.refreshAndRearm(using: handler, read: read)
+                }
             }
         }
+    }
+
+    /// Install the next observation before reading and publishing. A main
+    /// thread `.didSet` callback reaches this synchronously, before the
+    /// source setter returns.
+    private func refreshAndRearm(
+        using handler: PropertyObservationHandler,
+        read: @escaping @MainActor @Sendable () -> Value
+    ) {
+        let currentValue = trackedPropertyRead(read, onChange: { [weak handler] in
+            handler?.fire()
+        })
+        value = currentValue
     }
 }

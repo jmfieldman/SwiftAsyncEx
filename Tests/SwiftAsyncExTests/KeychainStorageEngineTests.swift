@@ -167,6 +167,7 @@ final class KeychainStorageEngineTests: XCTestCase {
 
     func testIntegratesWithPersistentProperty() async throws {
         let key = PersistentPropertyKey(key: "integrated")
+        let engine = self.engine!
         let p = await MainActor.run {
             PersistentProperty(
                 storageEngine: engine,
