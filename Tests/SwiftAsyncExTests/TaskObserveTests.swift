@@ -127,14 +127,13 @@ final class TaskObserveTests: XCTestCase {
     }
 
     func testEmitsEveryChangeWhenRemoveDuplicatesFalse() async {
-        // Smoke-test the dedup-off code path. Note: Swift Observation filters
-        // same-value writes at the runtime level (an assignment of an equal
-        // value does not trigger `onChange`), so there is no observable
-        // difference between `removeDuplicates: true` and `false` for direct
-        // stored properties. The flag matters for composed/projected
-        // expressions where two distinct writes produce equal projected
-        // values — those still fire Observation but can be deduped at the
-        // pump. Here we just verify the flag doesn't break the happy path.
+        // Smoke-test the dedup-off code path. Note: the `@Observable` macro
+        // filters same-value writes for stored properties of a concrete
+        // `Equatable` type, as here, so there is no observable difference
+        // between `removeDuplicates: true` and `false` for this model. The
+        // flag matters for generic properties such as `MutableProperty<Int>`,
+        // and for composed/projected expressions. See
+        // `testEqualWriteToGenericPropertyDeliveredWhenRemoveDuplicatesFalse`.
         let model = TestModel()
         let (stream, cont) = AsyncStream<Int>.makeStream()
 
@@ -394,6 +393,144 @@ final class TaskObserveTests: XCTestCase {
         cont.finish()
     }
 
+    // MARK: - Settling on the latest value
+
+    func testDeliversWriteMadeDuringPerform() async {
+        let source = MutableProperty(0)
+        let log = ObservedLog<Int>()
+        let gate = DemuxerAsyncGate()
+
+        let task = Task.observe(expression: { source.value }) { value in
+            log.add(value)
+            if value == 1 { await gate.wait() }
+        }
+        await awaitCondition("initial delivered") { log.values == [0] }
+
+        source.value = 1
+        await awaitCondition("first write delivered") { log.values == [0, 1] }
+
+        // `perform(1)` is still suspended on the gate.
+        source.value = 2
+        await gate.open()
+        await awaitCondition("write during perform delivered") { log.values == [0, 1, 2] }
+
+        // Delivered once, not again.
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(log.values, [0, 1, 2])
+        task.cancel()
+    }
+
+    func testDeliversWriteMadeDuringInitialPerform() async {
+        let source = MutableProperty(0)
+        let log = ObservedLog<Int>()
+        let gate = DemuxerAsyncGate()
+
+        let task = Task.observe(expression: { source.value }) { value in
+            log.add(value)
+            if value == 0 { await gate.wait() }
+        }
+        await awaitCondition("initial delivered") { log.values == [0] }
+
+        source.value = 7
+        await gate.open()
+        await awaitCondition("write during perform delivered") { log.values == [0, 7] }
+        task.cancel()
+    }
+
+    func testDeliversNonEquatableWriteMadeDuringPerform() async {
+        let source = MutableProperty(NonEquatableValue(0))
+        let log = ObservedLog<Int>()
+        let gate = DemuxerAsyncGate()
+
+        let task = Task.observe(expression: { source.value }) { value in
+            log.add(value.number)
+            if value.number == 1 { await gate.wait() }
+        }
+        await awaitCondition("initial delivered") { log.values == [0] }
+
+        source.value = NonEquatableValue(1)
+        await awaitCondition("first write delivered") { log.values == [0, 1] }
+
+        source.value = NonEquatableValue(2)
+        await gate.open()
+        await awaitCondition("write during perform delivered") { log.values == [0, 1, 2] }
+
+        // Delivered once, not again.
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(log.values, [0, 1, 2])
+        task.cancel()
+    }
+
+    func testBurstOfWritesSettlesOnLatestValue() async {
+        let source = MutableProperty(0)
+        let log = ObservedLog<Int>()
+
+        let task = Task.observe(expression: { source.value }) { log.add($0) }
+        await awaitCondition("initial delivered") { log.values == [0] }
+
+        source.value = 1
+        source.value = 2
+        source.value = 3
+        await awaitCondition("latest delivered") { log.values.last == 3 }
+        task.cancel()
+    }
+
+    func testEqualWriteToGenericPropertyIsSkippedByDefault() async {
+        let source = MutableProperty(1)
+        let log = ObservedLog<Int>()
+
+        let task = Task.observe(expression: { source.value }) { log.add($0) }
+        await awaitCondition("initial delivered") { log.values == [1] }
+
+        source.value = 1
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(log.values, [1])
+
+        source.value = 2
+        await awaitCondition("new value delivered") { log.values == [1, 2] }
+        task.cancel()
+    }
+
+    func testKeyPathEqualWriteToGenericPropertyIsSkippedByDefault() async {
+        let source = MutableProperty(1)
+        let log = ObservedLog<Int>()
+
+        let task = Task.observe(\.value, on: source) { log.add($0) }
+        await awaitCondition("initial delivered") { log.values == [1] }
+
+        source.value = 1
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(log.values, [1])
+
+        source.value = 2
+        await awaitCondition("new value delivered") { log.values == [1, 2] }
+        task.cancel()
+    }
+
+    func testKeyPathEqualWriteDeliveredWhenRemoveDuplicatesFalse() async {
+        let source = MutableProperty(1)
+        let log = ObservedLog<Int>()
+
+        let task = Task.observe(\.value, on: source, removeDuplicates: false) { log.add($0) }
+        await awaitCondition("initial delivered") { log.values == [1] }
+
+        source.value = 1
+        await awaitCondition("equal write delivered") { log.values == [1, 1] }
+        task.cancel()
+    }
+
+    func testEqualWriteToGenericPropertyDeliveredWhenRemoveDuplicatesFalse() async {
+        let source = MutableProperty(1)
+        let log = ObservedLog<Int>()
+
+        let task = Task.observe(removeDuplicates: false, expression: { source.value }) { log.add($0) }
+        await awaitCondition("initial delivered") { log.values == [1] }
+
+        source.value = 1
+        await awaitCondition("equal write delivered") { log.values == [1, 1] }
+        task.cancel()
+    }
+
     // MARK: - Overload resolution
 
     // Compiles-only check: when T is Equatable, the Equatable overload is
@@ -421,3 +558,17 @@ private final class FireCounter {
 
 @MainActor
 private final class OwnerBox {}
+
+/// A value with no `Equatable` conformance, so it can't be deduplicated.
+struct NonEquatableValue: Sendable {
+    let number: Int
+    init(_ number: Int) { self.number = number }
+}
+
+/// A thread-safe record of what an observer received.
+final class ObservedLog<Element: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var elements: [Element] = []
+    var values: [Element] { lock.withLock { elements } }
+    func add(_ element: Element) { lock.withLock { elements.append(element) } }
+}

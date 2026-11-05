@@ -24,7 +24,7 @@ These are small things. The point of the rewrite-to-structured-concurrency story
 
 ### `Task.observe(expression:perform:) -> Task<Void, Never>`
 
-An Observation-tracking helper that spawns a task which calls `perform` every time the value returned by the tracked expression changes. Hides the re-arm loop and the `willSet` / `Task.yield()` ordering problem.
+An Observation-tracking helper that spawns a task which calls `perform` when the value returned by the tracked expression changes. Hides the re-arm loop and the `willSet` / `Task.yield()` ordering problem, and picks up writes made while an async `perform` is running. See the [observation contract](#observation-contract).
 
 Exposed as a static factory on `Task` (consistent with `Task.bound(to:)` elsewhere in this library).
 
@@ -215,7 +215,23 @@ An `@Observable @MainActor` single-value box. Read and write through `.value`; u
 - `Property(tracking: { ... })` — derive a value from a closure that reads `@Observable` state. Updates when any state the closure reads changes. The general-purpose `map` / `combineLatest` / keyPath-projection constructor collapsed into one Observation-tracked closure.
 - `Property(initial: T, from: seq)` — seed a value, then follow an `AsyncSequence<T>`. Bridges `AsyncChannel`, `AsyncStream`, `NotificationCenter.notifications(...)`, Combine's `.values`, and anything else that adopts `AsyncSequence`.
 
-Mirror- and tracking-mode updates lag source writes by one runloop tick (Observation's `onChange` fires on `willSet`; the internal pump yields before re-reading so the committed value is the one propagated). The pump is bound to the `Property`'s lifetime — when it deallocates, the pump is cancelled automatically.
+On OS 27 and later, main-thread writes reach mirror- and tracking-mode properties synchronously, before the source's setter returns. On earlier versions, and for writes from off the main thread, the update is queued on the main actor and arrives shortly after. Observation stops when the `Property` deallocates.
+
+Tracking closures run more than once per change, so keep them cheap and free of side effects.
+
+#### Observation contract
+
+`Property`, `asAsyncSequence()`, `<~`, and `Task.observe` follow the same rules:
+
+1. **Observers settle on the latest value.** A burst of writes may arrive as just its final value: writing `1`, `2`, `3` in quick succession may deliver only `3`. These APIs are for state, not an event log.
+2. **No double sends.** A single write is delivered at most once.
+3. **Equal values are skipped.** For `Equatable` values, a value equal to the last one delivered is not delivered again, so a repeated write can't be used as a "fire again" signal. Pass `removeDuplicates: false` to `Task.observe` to opt out. A custom `==` that ignores some fields means a change to only those fields isn't delivered.
+
+Some limits apply:
+
+- **Off-main writes to your own `@Observable` classes.** A non-`Equatable` value can rarely be delivered twice, since there's no way to compare it and the alternative is risking a stale value. Make the type `Equatable` to rule this out. On OS versions before 27, a stale value is also possible in a narrow race, until the next write.
+- **Closures that read several properties.** A `Property(tracking:)` closure can briefly produce an intermediate value when one write reaches its dependencies at different times. It still settles on the right value.
+- **SwiftUI and `withObservationTracking`.** These work directly with Observation, so they're notified of repeated writes to a `MutableProperty` and read whatever the value is at that point.
 
 #### Binding operator `<~`
 
@@ -231,7 +247,7 @@ The returned `Task<Void, Never>` is auto-bound to the destination's lifetime; th
 
 #### Bridging back to `AsyncSequence`
 
-`asAsyncSequence()` on any `PropertyProtocol` returns an `AsyncStream<Value>` that yields the current value immediately and then each subsequent change — useful for non-UI consumers that prefer `for await`:
+`asAsyncSequence()` on any `PropertyProtocol` returns an `AsyncStream<Value>` that yields the current value immediately and then subsequent changes, following the [observation contract](#observation-contract) — useful for non-UI consumers that prefer `for await`:
 
 ```swift
 for await count in inbox.unreadCount.asAsyncSequence() {
@@ -376,7 +392,7 @@ Intended for per-key caches, per-ID fetches, and any pattern where "the same und
 
 ## Requirements
 
-- Swift 5.9+
+- Swift 6.4+ (Xcode 27+)
 - **iOS 17 / macOS 14 / tvOS 17 / watchOS 10** — the Observation framework floor, and the only platform minimum this library targets.
 
 The library is written against iOS 17 APIs. Newer OS features (e.g. the iOS 26 `Observations` async sequence) are used only behind `@available` checks with a fallback that works on the floor; no public entry point requires a higher OS than the package minimum. CI will build and test against the minimum.
@@ -386,7 +402,7 @@ The library is written against iOS 17 APIs. Newer OS features (e.g. the iOS 26 `
 Add via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/jmfieldman/SwiftAsyncEx.git", from: "1.1.0")
+.package(url: "https://github.com/jmfieldman/SwiftAsyncEx.git", from: "1.6.0")
 ```
 
 and depend on the `SwiftAsyncEx` product from your target.

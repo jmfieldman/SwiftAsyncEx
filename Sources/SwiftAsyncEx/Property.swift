@@ -12,20 +12,15 @@ import Observation
 @MainActor
 private func trackedPropertyRead<Value>(
     _ read: @MainActor () -> Value,
-    onChange: @escaping @Sendable () -> Void
+    handler: PropertyObservationHandler
 ) -> Value {
-    if #available(iOS 27, macOS 27, tvOS 27, watchOS 27, *) {
-        return withObservationTracking(options: [.didSet], read, onChange: { _ in
-            onChange()
+    if #available(iOS 27, macOS 27, tvOS 27, watchOS 27, visionOS 27, *) {
+        return withObservationTracking(options: [.didSet], read, onChange: { [weak handler] _ in
+            handler?.valueDidCommit()
         })
     }
-    return withObservationTracking(read, onChange: {
-        // The legacy callback is willSet. Let the setter commit before
-        // reading and publishing the new value.
-        Task { @MainActor in
-            await Task<Never, Never>.yield()
-            onChange()
-        }
+    return withObservationTracking(read, onChange: { [weak handler] in
+        handler?.valueWillCommit()
     })
 }
 
@@ -33,26 +28,58 @@ private func trackedPropertyRead<Value>(
 /// box weakly, avoiding a source -> callback -> source retain cycle.
 private final class PropertyObservationHandler: @unchecked Sendable {
     private let lock = NSLock()
-    private var handler: (@Sendable () -> Void)?
+    private var refresh: (@MainActor @Sendable () -> Void)?
     private var changePending = false
+    private var refreshQueued = false
 
-    func install(_ handler: @escaping @Sendable () -> Void) {
+    @MainActor
+    func install(_ refresh: @escaping @MainActor @Sendable () -> Void) {
         let fireNow = lock.withLock {
-            self.handler = handler
+            self.refresh = refresh
             let pending = changePending
             changePending = false
             return pending
         }
-        if fireNow { handler() }
+        if fireNow { refresh() }
     }
 
-    func fire() {
-        let callback: (@Sendable () -> Void)? = lock.withLock {
-            guard let handler else {
-                changePending = true
-                return nil
-            }
-            return handler
+    /// The source has committed. Refresh synchronously on the main thread, so
+    /// the new value is visible before the source setter returns.
+    func valueDidCommit() {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { runRefresh() }
+        } else {
+            queueRefresh(yieldFirst: false)
+        }
+    }
+
+    /// The source is about to commit. Let the setter finish before reading.
+    func valueWillCommit() {
+        queueRefresh(yieldFirst: true)
+    }
+
+    /// Queue at most one refresh at a time. Dropping a change while one is
+    /// queued is safe, because that refresh hasn't read the source yet.
+    private func queueRefresh(yieldFirst: Bool) {
+        let shouldQueue = lock.withLock {
+            if refreshQueued { return false }
+            refreshQueued = true
+            return true
+        }
+        guard shouldQueue else { return }
+        Task { @MainActor [weak self] in
+            if yieldFirst { await Task<Never, Never>.yield() }
+            guard let self else { return }
+            self.lock.withLock { self.refreshQueued = false }
+            self.runRefresh()
+        }
+    }
+
+    @MainActor
+    private func runRefresh() {
+        let callback: (@MainActor @Sendable () -> Void)? = lock.withLock {
+            if refresh == nil { changePending = true }
+            return refresh
         }
         callback?()
     }
@@ -73,9 +100,12 @@ private final class PropertyObservationHandler: @unchecked Sendable {
 /// - `Property(initial:from:)` — seed an initial value and then follow an
 ///   `AsyncSequence`.
 ///
-/// On supported runtimes, main-thread mirror- and tracking-mode mutations
-/// propagate synchronously after the source commits. Other mutations are
-/// refreshed on the main actor.
+/// Mirror- and tracking-mode properties always settle on the latest value of
+/// their source. A burst of writes may be delivered as just its final value,
+/// and a new value that is equal to the current one (for `Equatable` values)
+/// is not published. On OS 27 and later, main-thread mutations propagate
+/// synchronously after the source commits. Other mutations are refreshed on
+/// the main actor.
 @Observable
 @MainActor
 public final class Property<Value: Sendable>: PropertyProtocol {
@@ -105,21 +135,17 @@ public final class Property<Value: Sendable>: PropertyProtocol {
     /// The mirror holds `source` strongly for the duration of its own
     /// lifetime, so `source` stays alive as long as consumers hold this
     /// Property.
-    public init(mirroring source: some PropertyProtocol<Value>) {
-        let read: @MainActor @Sendable () -> Value = { source.value }
-        let handler = PropertyObservationHandler()
-        self.value = trackedPropertyRead(read, onChange: { [weak handler] in
-            handler?.fire()
-        })
-        self.observationHandler = handler
-        installRefreshHandler(handler, read: read)
+    public convenience init(mirroring source: some PropertyProtocol<Value>) {
+        self.init(tracking: { source.value })
     }
 
     // MARK: - Track an Observation-reading closure
 
     /// Derive a `Property` from a closure that reads `@Observable` state.
-    /// The closure is evaluated once synchronously for the initial value,
-    /// then re-evaluated each time any `@Observable` state it reads changes.
+    /// The closure is evaluated synchronously for the initial value, then
+    /// re-evaluated each time any `@Observable` state it reads changes. It may
+    /// run more than once per change, so keep it cheap and free of side
+    /// effects.
     ///
     /// Universal form for projections that need to escape their producer's
     /// class identity — equivalent to `map` / `combineLatest` / keyPath
@@ -128,9 +154,10 @@ public final class Property<Value: Sendable>: PropertyProtocol {
     /// `@Observable` is strictly better.
     public init(tracking closure: @escaping @MainActor @Sendable () -> Value) {
         let handler = PropertyObservationHandler()
-        self.value = trackedPropertyRead(closure, onChange: { [weak handler] in
-            handler?.fire()
-        })
+        // Read again after arming: a write between the tracked read and the
+        // observation being installed would otherwise go unnoticed.
+        _ = trackedPropertyRead(closure, handler: handler)
+        self.value = closure()
         self.observationHandler = handler
         installRefreshHandler(handler, read: closure)
     }
@@ -188,30 +215,27 @@ public final class Property<Value: Sendable>: PropertyProtocol {
         read: @escaping @MainActor @Sendable () -> Value
     ) {
         handler.install { [weak self, weak handler] in
-            guard let handler else { return }
-            if Thread.isMainThread {
-                MainActor.assumeIsolated {
-                    self?.refreshAndRearm(using: handler, read: read)
-                }
-            } else {
-                Task { @MainActor [weak self, weak handler] in
-                    guard let self, let handler else { return }
-                    self.refreshAndRearm(using: handler, read: read)
-                }
-            }
+            guard let self, let handler else { return }
+            self.refreshAndRearm(using: handler, read: read)
         }
     }
 
-    /// Install the next observation before reading and publishing. A main
-    /// thread `.didSet` callback reaches this synchronously, before the
-    /// source setter returns.
+    /// Install the next observation, then read and publish. Observation only
+    /// reports writes made after it is installed, so the read must come after:
+    /// any earlier write is seen by the read, and any later one fires again.
+    ///
+    /// A write can be both, which is why equal values aren't published again.
+    /// Values that aren't `Equatable` can't be compared, so a write from off
+    /// the main thread can rarely publish twice. Main-thread writes can't
+    /// interleave with this method, so they always publish once.
     private func refreshAndRearm(
         using handler: PropertyObservationHandler,
         read: @escaping @MainActor @Sendable () -> Value
     ) {
-        let currentValue = trackedPropertyRead(read, onChange: { [weak handler] in
-            handler?.fire()
-        })
-        value = currentValue
+        _ = trackedPropertyRead(read, handler: handler)
+        let latest = read()
+        if !propertyValuesEqual(value, latest) {
+            value = latest
+        }
     }
 }

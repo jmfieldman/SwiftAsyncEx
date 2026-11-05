@@ -72,6 +72,11 @@ extension PropertyProtocol {
     /// on each subsequent change. Terminates when the stream's consumer
     /// cancels or when `self` is deallocated.
     ///
+    /// The stream always settles on the latest value, but it isn't a log of
+    /// every write: a burst of writes may arrive as just its final value, and
+    /// a value equal to the last one yielded (for `Equatable` values) is
+    /// skipped.
+    ///
     /// Uses Observation tracking under the hood. Updates lag source writes by
     /// one runloop tick (`withObservationTracking`'s `onChange` fires on
     /// `willSet`; the pump yields before re-reading so the committed value is
@@ -84,6 +89,7 @@ extension PropertyProtocol {
                     return
                 }
                 continuation.yield(initial)
+                var last = initial
 
                 while !Task<Never, Never>.isCancelled {
                     let box = ObservationContinuationBox()
@@ -114,6 +120,8 @@ extension PropertyProtocol {
                     // setter commits before we re-read.
                     await Task<Never, Never>.yield()
                     guard let nextValue = self?.value else { break }
+                    if propertyValuesEqual(last, nextValue) { continue }
+                    last = nextValue
                     continuation.yield(nextValue)
                 }
                 continuation.finish()
@@ -121,6 +129,20 @@ extension PropertyProtocol {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
+}
+
+// MARK: - Value comparison
+
+/// Whether two values are known to be equal. `Value` is unconstrained so that
+/// properties can hold non-`Equatable` values, so this checks at runtime.
+/// Values that aren't `Equatable` are never considered equal.
+internal func propertyValuesEqual<Value>(_ lhs: Value, _ rhs: Value) -> Bool {
+    guard let lhs = lhs as? any Equatable else { return false }
+    return equatableValue(lhs, equals: rhs)
+}
+
+private func equatableValue<T: Equatable>(_ lhs: T, equals rhs: Any) -> Bool {
+    (rhs as? T) == lhs
 }
 
 // MARK: - Observation continuation box
@@ -131,7 +153,7 @@ extension PropertyProtocol {
 /// cancellation arrives before the continuation has been installed.
 ///
 /// Shared between the observation-pump loops in `asAsyncSequence()` and
-/// `Property`'s internal mirror/tracking inits.
+/// `Task.observe`.
 internal final class ObservationContinuationBox: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?

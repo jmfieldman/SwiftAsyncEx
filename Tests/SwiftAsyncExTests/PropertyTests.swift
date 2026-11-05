@@ -39,8 +39,8 @@ final class PropertyTests: XCTestCase {
     }
 
     func testMirroringUpdatesSynchronouslyOnMainThread() throws {
-        guard #available(macOS 27, *) else {
-            throw XCTSkip("Synchronous didSet propagation requires macOS 27")
+        guard #available(iOS 27, macOS 27, tvOS 27, watchOS 27, visionOS 27, *) else {
+            throw XCTSkip("Synchronous didSet propagation requires OS 27")
         }
 
         let source = MutableProperty(0)
@@ -97,8 +97,8 @@ final class PropertyTests: XCTestCase {
     }
 
     func testTrackingClosureUpdatesSynchronouslyOnMainThread() throws {
-        guard #available(macOS 27, *) else {
-            throw XCTSkip("Synchronous didSet propagation requires macOS 27")
+        guard #available(iOS 27, macOS 27, tvOS 27, watchOS 27, visionOS 27, *) else {
+            throw XCTSkip("Synchronous didSet propagation requires OS 27")
         }
 
         let source = MutableProperty(2)
@@ -177,6 +177,74 @@ final class PropertyTests: XCTestCase {
         XCTAssertEqual(selected.value, 999)
     }
 
+    // MARK: - Settling on the latest value
+
+    func testOffMainWritesAlwaysSettleOnLatestValue() async throws {
+        let spinner = DemuxerCounter()
+        for round in 0..<1_000 {
+            let source = LockedObservableInt(0)
+            let property = Property(tracking: { source.value })
+
+            // Vary the spacing so writes land at different points in a refresh.
+            let pause = round % 64
+            await Task.detached {
+                for value in 1...20 {
+                    source.value = value
+                    for _ in 0..<pause { spinner.increment() }
+                }
+            }.value
+
+            // There is no later write to rescue a missed one.
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(5))
+            while property.value != 20, clock.now < deadline {
+                await Task<Never, Never>.yield()
+            }
+            guard property.value == 20 else {
+                XCTFail("Round \(round): stuck on \(property.value), source is \(source.value)")
+                return
+            }
+        }
+    }
+
+    // MARK: - Equal values
+
+    func testMirrorDoesNotPublishEqualWrite() async {
+        let source = MutableProperty(1)
+        let mirror = Property(mirroring: source)
+
+        let fired = await changeFired(on: { _ = mirror.value }, during: { source.value = 1 })
+
+        XCTAssertFalse(fired)
+    }
+
+    func testMirrorPublishesChangedValue() async {
+        let source = MutableProperty(1)
+        let mirror = Property(mirroring: source)
+
+        let fired = await changeFired(on: { _ = mirror.value }, during: { source.value = 2 })
+
+        XCTAssertTrue(fired)
+    }
+
+    func testTrackingDoesNotPublishEqualResult() async {
+        let source = MutableProperty(1)
+        let isPositive = Property(tracking: { source.value > 0 })
+
+        let fired = await changeFired(on: { _ = isPositive.value }, during: { source.value = 2 })
+
+        XCTAssertFalse(fired)
+    }
+
+    func testMirrorPublishesEveryWriteOfNonEquatableValue() async {
+        let source = MutableProperty(NonEquatableValue(0))
+        let mirror = Property(mirroring: source)
+
+        let fired = await changeFired(on: { _ = mirror.value }, during: { source.value = NonEquatableValue(0) })
+
+        XCTAssertTrue(fired)
+    }
+
     // MARK: - AsyncSequence init
 
     func testInitFromAsyncSequence() async {
@@ -249,11 +317,78 @@ final class PropertyTests: XCTestCase {
         XCTAssertEqual(v2, 2)
     }
 
+    func testAsAsyncSequenceSkipsEqualValues() async {
+        let source = MutableProperty(0)
+        let log = ObservedLog<Int>()
+        let task = Task { for await value in source.asAsyncSequence() { log.add(value) } }
+        await awaitCondition("initial yielded") { log.values == [0] }
+
+        source.value = 0
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(log.values, [0])
+
+        source.value = 1
+        await awaitCondition("new value yielded") { log.values == [0, 1] }
+
+        source.value = 1
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(log.values, [0, 1])
+        task.cancel()
+    }
+
+    func testAsAsyncSequenceYieldsEachWriteOfNonEquatableValueOnce() async {
+        let source = MutableProperty(NonEquatableValue(0))
+        let mirror = Property(mirroring: source)
+        let log = ObservedLog<Int>()
+        let task = Task { for await value in mirror.asAsyncSequence() { log.add(value.number) } }
+        await awaitCondition("initial yielded") { log.values == [0] }
+
+        source.value = NonEquatableValue(1)
+        await awaitCondition("first write yielded") { log.values == [0, 1] }
+
+        source.value = NonEquatableValue(1)
+        await awaitCondition("second write yielded") { log.values == [0, 1, 1] }
+
+        try? await Task.sleep(for: .milliseconds(20))
+        XCTAssertEqual(log.values, [0, 1, 1])
+        task.cancel()
+    }
+
+    func testAsAsyncSequenceBurstSettlesOnLatestValue() async {
+        let source = MutableProperty(0)
+        let log = ObservedLog<Int>()
+        let task = Task { for await value in source.asAsyncSequence() { log.add(value) } }
+        await awaitCondition("initial yielded") { log.values == [0] }
+
+        source.value = 1
+        source.value = 2
+        source.value = 3
+        await awaitCondition("latest yielded") { log.values.last == 3 }
+        task.cancel()
+    }
+
     // MARK: - Utilities
 
+    /// Whether a change to the state read by `read` is reported after `write`.
+    /// Gives a queued refresh time to run, since not every path is synchronous.
+    private func changeFired(
+        on read: @escaping @MainActor () -> Void,
+        during write: () -> Void
+    ) async -> Bool {
+        let log = ObservedLog<Bool>()
+        withObservationTracking {
+            read()
+        } onChange: {
+            log.add(true)
+        }
+        write()
+        for _ in 0..<20 { await Task<Never, Never>.yield() }
+        return !log.values.isEmpty
+    }
+
     /// Spin the main actor (via `Task.yield`) until `property.value == target`
-    /// or a modest attempt limit is reached. The one-tick pump lag means a
-    /// single yield is not always enough.
+    /// or a modest attempt limit is reached. An update may be queued on the
+    /// main actor, so a single yield is not always enough.
     @MainActor
     private func waitForValue<Value: Equatable & Sendable>(
         _ property: Property<Value>,
