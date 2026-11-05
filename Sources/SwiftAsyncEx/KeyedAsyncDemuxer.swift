@@ -24,6 +24,12 @@ public final class KeyedAsyncDemuxer<Key: Hashable & Sendable, Output: Sendable>
     private var waiters: [Key: [CheckedContinuation<Output, Never>]] = [:]
     private var activeTasks: [Key: Task<Void, Never>] = [:]
 
+    /// The number of callers attached to `key`'s current execution. Exposed
+    /// `internal` so tests can synchronize on attachment.
+    internal func waiterCount(for key: Key) -> Int {
+        lock.withLock { waiters[key]?.count ?? 0 }
+    }
+
     public init(_ factory: @escaping @Sendable (Key) async -> Output) {
         self.factory = factory
     }
@@ -67,6 +73,12 @@ public final class ThrowingKeyedAsyncDemuxer<Key: Hashable & Sendable, Output: S
     private var waiters: [Key: [(UUID, CheckedContinuation<Output, any Error>)]] = [:]
     private var activeTasks: [Key: Task<Void, Never>] = [:]
 
+    /// The number of callers attached to `key`'s current execution. Exposed
+    /// `internal` so tests can synchronize on attachment.
+    internal func waiterCount(for key: Key) -> Int {
+        lock.withLock { waiters[key]?.count ?? 0 }
+    }
+
     public init(_ factory: @escaping @Sendable (Key) async throws -> Output) {
         self.factory = factory
     }
@@ -79,6 +91,14 @@ public final class ThrowingKeyedAsyncDemuxer<Key: Hashable & Sendable, Output: S
             return try await withCheckedThrowingContinuation {
                 (cont: CheckedContinuation<Output, any Error>) in
                 lock.withLock {
+                    // A cancel that landed before this point found nothing
+                    // for `onCancel` to remove, so honor it here. Any later
+                    // cancel runs `onCancel` after this lock is released,
+                    // and finds the waiter.
+                    if Task.isCancelled {
+                        cont.resume(throwing: CancellationError())
+                        return
+                    }
                     waiters[key, default: []].append((id, cont))
                     if activeTasks[key] == nil {
                         activeTasks[key] = Task { [self] in

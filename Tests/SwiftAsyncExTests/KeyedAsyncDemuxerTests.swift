@@ -38,7 +38,7 @@ final class KeyedAsyncDemuxerTests: XCTestCase {
             }
         }
 
-        for _ in 0..<100 { await Task<Never, Never>.yield() }
+        await awaitCondition("all callers attached") { demuxer.waiterCount(for: "abc") == 20 }
         await gate.open()
 
         let results = await group.value
@@ -118,7 +118,7 @@ final class KeyedAsyncDemuxerTests: XCTestCase {
             }
         }
 
-        for _ in 0..<100 { await Task<Never, Never>.yield() }
+        await awaitCondition("all callers attached") { demuxer.waiterCount(for: "x") == 10 }
         await gate.open()
 
         let errorCount = await group.value
@@ -175,9 +175,9 @@ final class KeyedAsyncDemuxerTests: XCTestCase {
             }
         }
 
-        for _ in 0..<10 { await Task<Never, Never>.yield() }
+        await awaitCondition("both waiters attached") { demuxer.waiterCount(for: "k") == 2 }
         cancellable.cancel()
-        for _ in 0..<10 { await Task<Never, Never>.yield() }
+        await awaitCondition("cancelled waiter detached") { demuxer.waiterCount(for: "k") == 1 }
         await gate.open()
 
         let cancelledResult = await cancellable.value
@@ -185,6 +185,31 @@ final class KeyedAsyncDemuxerTests: XCTestCase {
         XCTAssertEqual(cancelledResult, "cancelled")
         XCTAssertEqual(normalResult, 77)
         XCTAssertEqual(counter.value, 1)
+    }
+
+    /// See `testThrowingCancellationRacingRegistrationIsNotLost` in
+    /// `AsyncDemuxerTests`.
+    func testThrowingKeyedCancellationRacingRegistrationIsNotLost() async {
+        let spinner = DemuxerCounter()
+        for round in 0..<cancellationRaceRounds {
+            let gate = DemuxerAsyncGate()
+            let demuxer = ThrowingKeyedAsyncDemuxer<String, Int> { _ in
+                await gate.wait()
+                return 1
+            }
+
+            let waiter = Task { try await demuxer.execute(key: "k") }
+            // Vary the delay so the cancel lands at different points in
+            // the waiter's startup.
+            for _ in 0..<(round % 256) { spinner.increment() }
+            waiter.cancel()
+
+            let outcome = await resultWithGateWatchdog(of: waiter, gate: gate)
+            guard outcome == "cancelled" else {
+                XCTFail("Round \(round): cancelled waiter finished as \(outcome)")
+                return
+            }
+        }
     }
 }
 

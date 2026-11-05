@@ -23,6 +23,12 @@ public final class AsyncDemuxer<Output: Sendable>: @unchecked Sendable {
     private var waiters: [CheckedContinuation<Output, Never>] = []
     private var currentTask: Task<Void, Never>?
 
+    /// The number of callers attached to the current execution. Exposed
+    /// `internal` so tests can synchronize on attachment.
+    internal var waiterCount: Int {
+        lock.withLock { waiters.count }
+    }
+
     public init(_ work: @escaping @Sendable () async -> Output) {
         self.work = work
     }
@@ -66,6 +72,18 @@ public final class ThrowingAsyncDemuxer<Output: Sendable>: @unchecked Sendable {
     private var waiters: [(UUID, CheckedContinuation<Output, any Error>)] = []
     private var currentTask: Task<Void, Never>?
 
+    /// The number of callers attached to the current execution. Exposed
+    /// `internal` so tests can synchronize on attachment.
+    internal var waiterCount: Int {
+        lock.withLock { waiters.count }
+    }
+
+    /// Whether a shared execution is in flight. Exposed `internal` so tests
+    /// can synchronize on completion.
+    internal var isExecuting: Bool {
+        lock.withLock { currentTask != nil }
+    }
+
     public init(_ work: @escaping @Sendable () async throws -> Output) {
         self.work = work
     }
@@ -78,6 +96,14 @@ public final class ThrowingAsyncDemuxer<Output: Sendable>: @unchecked Sendable {
             return try await withCheckedThrowingContinuation {
                 (cont: CheckedContinuation<Output, any Error>) in
                 lock.withLock {
+                    // A cancel that landed before this point found nothing
+                    // for `onCancel` to remove, so honor it here. Any later
+                    // cancel runs `onCancel` after this lock is released,
+                    // and finds the waiter.
+                    if Task.isCancelled {
+                        cont.resume(throwing: CancellationError())
+                        return
+                    }
                     waiters.append((id, cont))
                     if currentTask == nil {
                         currentTask = Task { [self] in

@@ -41,9 +41,9 @@ final class AsyncDemuxerTests: XCTestCase {
             }
         }
 
-        // Give every task-group member a chance to attach as a waiter
-        // before we unblock the shared execution.
-        for _ in 0..<100 { await Task<Never, Never>.yield() }
+        // Every task-group member must attach as a waiter before we unblock
+        // the shared execution; a later caller would rightly start fresh work.
+        await awaitCondition("all callers attached") { demuxer.waiterCount == 20 }
         await gate.open()
 
         let results = await group.value
@@ -101,7 +101,7 @@ final class AsyncDemuxerTests: XCTestCase {
             }
         }
 
-        for _ in 0..<100 { await Task<Never, Never>.yield() }
+        await awaitCondition("all callers attached") { demuxer.waiterCount == 10 }
         await gate.open()
 
         let errorCount = await group.value
@@ -153,12 +153,12 @@ final class AsyncDemuxerTests: XCTestCase {
         }
 
         // Let both waiters register.
-        for _ in 0..<10 { await Task<Never, Never>.yield() }
+        await awaitCondition("both waiters attached") { demuxer.waiterCount == 2 }
 
         cancellable.cancel()
 
-        // Give the cancellation handler a chance to run.
-        for _ in 0..<10 { await Task<Never, Never>.yield() }
+        // The cancellation handler detaches the cancelled waiter.
+        await awaitCondition("cancelled waiter detached") { demuxer.waiterCount == 1 }
 
         // Release the work so the normal waiter completes.
         await gate.open()
@@ -182,27 +182,54 @@ final class AsyncDemuxerTests: XCTestCase {
         let a = Task { try? await demuxer.execute() }
         let b = Task { try? await demuxer.execute() }
 
-        for _ in 0..<10 { await Task<Never, Never>.yield() }
+        await awaitCondition("both waiters attached") { demuxer.waiterCount == 2 }
         a.cancel()
         b.cancel()
 
         // Let cancellations land; the shared task is still waiting on gate.
-        for _ in 0..<10 { await Task<Never, Never>.yield() }
+        await awaitCondition("waiters detached") { demuxer.waiterCount == 0 }
 
         // Release so the first shared task drains (to no waiters).
         await gate.open()
         _ = await a.value
         _ = await b.value
+        await awaitCondition("first execution finished") { !demuxer.isExecuting }
 
         // A fresh execute should start a new work invocation.
         await gate.reset()
         let fresh = Task {
             try? await demuxer.execute()
         }
-        for _ in 0..<5 { await Task<Never, Never>.yield() }
+        await awaitCondition("fresh waiter attached") { demuxer.waiterCount == 1 }
         await gate.open()
         _ = await fresh.value
         XCTAssertEqual(counter.value, 2)
+    }
+
+    /// A cancel can land after `execute()` has checked for cancellation but
+    /// before the waiter registers, when the handler has nothing to remove.
+    /// The cancellation must still be honored, with the work still blocked.
+    func testThrowingCancellationRacingRegistrationIsNotLost() async {
+        let spinner = DemuxerCounter()
+        for round in 0..<cancellationRaceRounds {
+            let gate = DemuxerAsyncGate()
+            let demuxer = ThrowingAsyncDemuxer<Int> {
+                await gate.wait()
+                return 1
+            }
+
+            let waiter = Task { try await demuxer.execute() }
+            // Vary the delay so the cancel lands at different points in
+            // the waiter's startup.
+            for _ in 0..<(round % 256) { spinner.increment() }
+            waiter.cancel()
+
+            let outcome = await resultWithGateWatchdog(of: waiter, gate: gate)
+            guard outcome == "cancelled" else {
+                XCTFail("Round \(round): cancelled waiter finished as \(outcome)")
+                return
+            }
+        }
     }
 }
 
@@ -250,4 +277,53 @@ final class DemuxerAsyncGate: @unchecked Sendable {
 
 enum DemuxerTestError: Error, Equatable {
     case boom
+}
+
+/// How many times the cancellation race tests repeat. The race window is
+/// small, so a single attempt would rarely land in it.
+let cancellationRaceRounds = 5_000
+
+/// Poll until `condition` holds, failing the test if it doesn't within
+/// `timeout`. Use this rather than a fixed number of `Task.yield()` calls,
+/// which gives no guarantee that other tasks have made progress.
+func awaitCondition(
+    _ description: String,
+    timeout: Duration = .seconds(10),
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ condition: @Sendable () -> Bool
+) async {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !condition() {
+        guard clock.now < deadline else {
+            XCTFail("Timed out waiting for: \(description)", file: file, line: line)
+            return
+        }
+        try? await Task.sleep(for: .milliseconds(1))
+    }
+}
+
+/// Await a waiter that was cancelled while `gate` still blocks the work, and
+/// describe how it finished. If the cancellation was lost, the waiter would
+/// hang on the closed gate, so a watchdog eventually opens it and the waiter
+/// reports "completed".
+func resultWithGateWatchdog<Success: Sendable>(
+    of waiter: Task<Success, any Error>,
+    gate: DemuxerAsyncGate
+) async -> String {
+    let watchdog = Task {
+        try? await Task.sleep(for: .seconds(5))
+        await gate.open()
+    }
+    let result = await waiter.result
+    watchdog.cancel()
+    await gate.open()
+
+    switch result {
+    case .success:
+        return "completed"
+    case let .failure(error):
+        return error is CancellationError ? "cancelled" : "other error: \(error)"
+    }
 }

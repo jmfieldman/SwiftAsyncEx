@@ -22,8 +22,14 @@ final class TaskBoundTests: XCTestCase {
 
     func testBoundToBagIsPrunedOnCompletion() async {
         let bag = TaskBag()
-        let task = Task.bound(to: bag) { "ok" }
+        // Hold the task open so it can't be pruned before the first check.
+        let gate = DemuxerAsyncGate()
+        let task = Task.bound(to: bag) { () -> String in
+            await gate.wait()
+            return "ok"
+        }
         XCTAssertEqual(bag.count, 1)
+        await gate.open()
         _ = await task.value
         // Pruning happens inside the wrapped operation's defer, so by the
         // time the value resolves, the entry is already removed.
