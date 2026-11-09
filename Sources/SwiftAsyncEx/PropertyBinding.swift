@@ -33,12 +33,8 @@ public func <~ <P: MutablePropertyProtocol, S: AsyncSequence & Sendable>(
     source: S
 ) -> Task<Void, Never> where S.Element == P.Value {
     Task.bound(to: dest) { @MainActor [weak dest] in
-        do {
-            for try await element in source {
-                dest?.value = element
-            }
-        } catch {
-            // Source terminated with error; binding stops.
+        await pumpOnMainActor(source) { [weak dest] element in
+            dest?.value = element
         }
     }
 }

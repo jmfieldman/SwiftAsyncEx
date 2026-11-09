@@ -177,12 +177,8 @@ public final class Property<Value: Sendable>: PropertyProtocol {
     ) where S.Element == Value {
         self.value = initial
         Task.bound(to: self) { @MainActor [weak self] in
-            do {
-                for try await element in source {
-                    self?.value = element
-                }
-            } catch {
-                // Source terminated with error; pump stops.
+            await pumpOnMainActor(source) { [weak self] element in
+                self?.value = element
             }
         }
     }
@@ -198,12 +194,8 @@ public final class Property<Value: Sendable>: PropertyProtocol {
     ) where S.Element == Element, Value == Element? {
         self.value = nil
         Task.bound(to: self) { @MainActor [weak self] in
-            do {
-                for try await element in source {
-                    self?.value = element
-                }
-            } catch {
-                // Source terminated with error; pump stops.
+            await pumpOnMainActor(source) { [weak self] element in
+                self?.value = element
             }
         }
     }
